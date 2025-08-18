@@ -7,6 +7,7 @@ import requests
 import streamlit as st
 import html as _html
 import json as _json
+from string import Template
 from streamlit.components.v1 import html as st_html
 
 APP_TITLE = "My Blackhole — GitHub Cloud Web-Hard"
@@ -135,6 +136,8 @@ def build_data_uri(content_bytes: bytes) -> str:
 # Utils
 # =============================
 
+SnippetItem = Union[str, dict]
+
 def _b64decode_any(s: str) -> bytes:
     s = s.strip()
     pad = '=' * (-len(s) % 4)
@@ -146,8 +149,6 @@ def _b64decode_any(s: str) -> bytes:
 # =============================
 # Snippet helpers (③ Text Snippet)
 # =============================
-
-SnippetItem = Union[str, dict]
 
 def _normalize_snippet_item(x: SnippetItem) -> dict:
     if isinstance(x, dict):
@@ -185,7 +186,6 @@ def save_snippets(owner: str, repo: str, branch: str, path: str, token: str, sni
 
 st.set_page_config(page_title=APP_TITLE, page_icon="🕳️", layout="wide")
 
-# 상단 여백 최소화 + 탭 간격 축소 + 메모 버튼 폭 고정(확대)
 st.markdown(
     """
     <style>
@@ -201,14 +201,18 @@ st.markdown(
       .stApp iframe { width: 100% !important; min-width: 100% !important; display: block !important; }
       .stApp div:has(> iframe) { width: 100% !important; }
 
-      /* 메모 버튼 줄: 간격/정렬 + 폭/줄바꿈 제어 (더 넓게)*/
-      .memo-btn-row [data-testid="stButton"] > button{
-        margin:0 !important;
-        padding: .6rem 1.3rem;
-        border-radius: 14px;
-        min-width: 168px;          /* ← 좌우로 넓힘 */
-        white-space: nowrap;       /* 항상 한 줄 유지 */
+      /* 좌/우 라벨 통일 */
+      .section-label{
+        display:flex; align-items:center; gap:.4rem;
+        font-weight:600; font-size:.95rem; line-height:1.15;
+        margin: 0 0 .35rem 2px;
       }
+      .section-label .ico{ font-size:1.05rem; line-height:1; }
+
+      /* 드롭존 */
+      div[data-testid="stFileDropzone"] { min-height: 160px; }
+      div[data-testid="stFileUploader"] section[tabindex="0"] { min-height: 160px; padding: .9rem .9rem; }
+      section[data-testid="stFileUploadDropzone"] { min-height: 160px; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -232,7 +236,6 @@ def _init_state():
     if "memo_area" not in ss: ss.memo_area = ""
     if "uploader_key" not in ss: ss.uploader_key = 0
 
-    # 추가 설정
     if "memo_folder" not in ss:
         ss.memo_folder = ensure_folder_path(
             st.secrets.get("MEMO_FOLDER", path_join("my-blackhole", "_memo"))
@@ -244,13 +247,11 @@ def _init_state():
     if "inline_dl_limit_mb" not in ss:
         ss.inline_dl_limit_mb = float(st.secrets.get("INLINE_DL_LIMIT_MB", 10))
 
-    # ③ Snippet state
     if "_snippets_loaded" not in ss: ss._snippets_loaded = False
     if "snippets" not in ss: ss.snippets = []
     if "_snip_sha" not in ss: ss._snip_sha = None
     if "_snip_clear" not in ss: ss._snip_clear = False
 
-    # ② Memo: 최초 1회 자동 불러오기 플래그
     if "_memo_autoloaded" not in ss: ss._memo_autoloaded = False
 
 _init_state()
@@ -301,7 +302,6 @@ ready = bool(token and owner and repo and branch)
 try:
     qs = st.query_params
 
-    # ① 파일 삭제 (?del=base64(path))
     enc_val = qs.get("del", None)
     if enc_val and ready:
         enc = enc_val[0] if isinstance(enc_val, list) else enc_val
@@ -320,7 +320,6 @@ try:
                     pass
                 st.rerun()
 
-    # ③ 스니펫 삭제 (?snip_del=<index>)
     del_snip = qs.get("snip_del", None)
     if del_snip and ready:
         idx_str = del_snip[0] if isinstance(del_snip, list) else del_snip
@@ -345,7 +344,6 @@ try:
                 pass
             st.rerun()
 
-    # ③ 스니펫 정렬 저장 (?snip_reorder=<b64-json>)
     snip_reorder = qs.get("snip_reorder", None)
     if snip_reorder and ready:
         payload = snip_reorder[0] if isinstance(snip_reorder, list) else snip_reorder
@@ -374,116 +372,122 @@ except Exception:
     pass
 
 # =============================
-# TABS: ① 웹하드 / ② 메모장 / ③ 스니펫 / ④ 설정
+# TABS
 # =============================
 tab1, tab2, tab3, tab4 = st.tabs(["① 웹하드", "② 메모장", "③ 스니펫", "④ 설정"])
 
 # ---------- TAB 1: 웹하드 ----------
 with tab1:
-    st.header("① 파일 업로드 → GitHub")
-    st.markdown(
-        """
-        <style>
-          div[data-testid="stFileDropzone"] { min-height: 220px; }
-          div[data-testid="stFileUploader"] section[tabindex="0"] { min-height: 220px; padding: 1.25rem 1rem; }
-          section[data-testid="stFileUploadDropzone"] { min-height: 220px; }
-        </style>
-        """, unsafe_allow_html=True
-    )
-    files = st.file_uploader("파일을 드래그하거나 선택하세요 (여러 개 가능)", accept_multiple_files=True, key=f"uploader_{st.session_state.uploader_key}")
+    st.header("① 웹하드")
 
-    if ready and files:
-        commit_msg = "Upload via My Blackhole"
-        fps = tuple(sorted((f.name, getattr(f, "size", 0)) for f in files))
-        if st.session_state.get("_uploaded_selection_sig") != fps:
-            results = []
-            with st.spinner("업로드 중…"):
-                for f in files:
-                    try:
-                        base_name = f.name
-                        base, ext = os.path.splitext(base_name)
-                        candidate = path_join(folder, base_name)
-                        idx = 1
-                        while get_file_sha_if_exists(owner, repo, branch, candidate, token)[0]:
-                            candidate = path_join(folder, f"{base} ({idx}){ext}")
-                            idx += 1
-                        content = f.read()
-                        if len(content) > 95 * 1024 * 1024:
-                            raise RuntimeError("파일이 너무 큽니다 (API 한계 ~100MB)")
-                        put_file(owner, repo, branch, candidate, content, token, commit_msg, None)
-                        results.append({"name": os.path.basename(candidate), "size (KB)": round(len(content)/1024, 1), "status": "uploaded"})
-                    except Exception as e:
-                        results.append({"name": getattr(f, 'name', 'unknown'),
-                                        "size (KB)": round(getattr(f, 'size', 0)/1024, 1) if hasattr(f, 'size') else None,
-                                        "status": f"error: {e}"})
-            st.session_state["_uploaded_selection_sig"] = fps
-            if any(r.get("status") == "uploaded" for r in results):
-                st.session_state.uploader_key += 1
-                st.toast("업로드 완료")
-                st.rerun()
-            if any(isinstance(r.get("status"), str) and r["status"].startswith("error") for r in results):
-                st.warning("일부 항목 업로드 실패")
+    # 40:60 + top align
+    col_upload, col_list = st.columns([0.40, 0.60], vertical_alignment="top")
 
-    st.header("📁 폴더 파일 목록 / 다운로드 ↩︎")
-    with st.container(border=True):
-        try:
-            items = list_folder(owner, repo, branch, ensure_folder_path(folder), token) if ready else []
-            files_data = []
-            for it in items:
-                if it.get("type") == "file":
-                    rel_path = it.get("path")
-                    raw_url = f"{gh_raw_base(owner, repo, branch)}/{rel_path}"
-                    files_data.append({
-                        "name": it.get("name"),
-                        "size_kb": round(it.get("size", 0)/1024, 1),
-                        "raw_url": raw_url,
-                        "rel_path": rel_path,
-                        "sha": it.get("sha"),
-                    })
+    # ---- 좌: 업로더 ----
+    with col_upload:
+        # ⬆️ Upload 아이콘으로 변경 (심플)
+        st.markdown('<div class="section-label"><span class="ico">⬆️</span><span>파일 업로드</span></div>', unsafe_allow_html=True)
+        files = st.file_uploader(
+            "",
+            accept_multiple_files=True,
+            label_visibility="collapsed",
+            key=f"uploader_{st.session_state.uploader_key}"
+        )
 
-            if files_data:
-                is_private = repo_is_private(owner, repo, token) if ready else True
-                inline_limit_mb = float(st.session_state.get("inline_dl_limit_mb", 10))
-                inline_limit_kb = inline_limit_mb * 1024
+        if ready and files:
+            commit_msg = "Upload via My Blackhole"
+            fps = tuple(sorted((f.name, getattr(f, "size", 0)) for f in files))
+            if st.session_state.get("_uploaded_selection_sig") != fps:
+                results = []
+                with st.spinner("업로드 중…"):
+                    for f in files:
+                        try:
+                            base_name = f.name
+                            base, ext = os.path.splitext(base_name)
+                            candidate = path_join(folder, base_name)
+                            idx = 1
+                            while get_file_sha_if_exists(owner, repo, branch, candidate, token)[0]:
+                                candidate = path_join(folder, f"{base} ({idx}){ext}")
+                                idx += 1
+                            content = f.read()
+                            if len(content) > 95 * 1024 * 1024:
+                                raise RuntimeError("파일이 너무 큽니다 (API 한계 ~100MB)")
+                            put_file(owner, repo, branch, candidate, content, token, commit_msg, None)
+                            results.append({"name": os.path.basename(candidate), "size (KB)": round(len(content)/1024, 1), "status": "uploaded"})
+                        except Exception as e:
+                            results.append({"name": getattr(f, 'name', 'unknown'),
+                                            "size (KB)": round(getattr(f, 'size', 0)/1024, 1) if hasattr(f, 'size') else None,
+                                            "status": f"error: {e}"})
+                st.session_state["_uploaded_selection_sig"] = fps
+                if any(r.get("status") == "uploaded" for r in results):
+                    st.session_state.uploader_key += 1
+                    st.toast("업로드 완료")
+                    st.rerun()
+                if any(isinstance(r.get("status"), str) and r["status"].startswith("error") for r in results):
+                    st.warning("일부 항목 업로드 실패")
 
-                def _svg_download():
-                    return """<svg viewBox="0 0 24 24" width="18" height="18" fill="none"
-                    stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-                    <polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>"""
+    # ---- 우: 파일 목록 ----
+    with col_list:
+        st.markdown('<div class="section-label"><span class="ico">📁</span><span>파일 목록</span></div>', unsafe_allow_html=True)
+        with st.container(border=True):
+            try:
+                items = list_folder(owner, repo, branch, ensure_folder_path(folder), token) if ready else []
+                files_data = []
+                for it in items:
+                    if it.get("type") == "file":
+                        rel_path = it.get("path")
+                        raw_url = f"{gh_raw_base(owner, repo, branch)}/{rel_path}"
+                        files_data.append({
+                            "name": it.get("name"),
+                            "size_kb": round(it.get("size", 0)/1024, 1),
+                            "raw_url": raw_url,
+                            "rel_path": rel_path,
+                            "sha": it.get("sha"),
+                        })
 
-                def _svg_link():
-                    return """<svg viewBox="0 0 24 24" width="18" height="18" fill="none"
+                if files_data:
+                    is_private = repo_is_private(owner, repo, token) if ready else True
+                    inline_limit_mb = float(st.session_state.get("inline_dl_limit_mb", 10))
+                    inline_limit_kb = inline_limit_mb * 1024
+
+                    def _svg_download():
+                        return """<svg viewBox="0 0 24 24" width="16" height="16" fill="none"
                         stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                        <path d="M10 13a5 5 0 0 1 0-7l2-2a5 5 0 0 1 7 7l-1 1"/>
-                        <path d="M14 11a5 5 0 0 1 0 7l-2 2a5 5 0 0 1-7-7l1-1"/></svg>"""
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                        <polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>"""
 
-                def _svg_trash():
-                    return """<svg viewBox="0 0 24 24" width="18" height="18" fill="none"
-                    stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/>
-                    <path d="M10 11v6"/><path d="M14 11v6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>"""
+                    def _svg_link():
+                        return """<svg viewBox="0 0 24 24" width="16" height="16" fill="none"
+                            stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M10 13a5 5 0 0 1 0-7l2-2a5 5 0 0 1 7 7l-1 1"/>
+                            <path d="M14 11a5 5 0 0 1 0 7l-2 2a5 5 0 0 1-7-7l1-1"/></svg>"""
 
-                rows = []
-                for f in files_data:
-                    data_uri = ""
-                    raw_link = f["raw_url"]
-                    gh_web  = f"https://github.com/{owner}/{repo}/blob/{branch}/{f['rel_path']}?raw=1"
-                    try:
-                        if f["size_kb"] <= inline_limit_kb:
-                            _bytes = get_raw_file_bytes(owner, repo, branch, f["rel_path"], token, sha=f.get("sha"))
-                            data_uri = build_data_uri(_bytes)
-                    except Exception:
+                    def _svg_trash():
+                        return """<svg viewBox="0 0 24 24" width="16" height="16" fill="none"
+                        stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/>
+                        <path d="M10 11v6"/><path d="M14 11v6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>"""
+
+                    rows = []
+                    for f in files_data:
                         data_uri = ""
-                    dl_href  = data_uri if data_uri else (gh_web if is_private else raw_link)
-                    dl_title = "다운로드" + ("" if data_uri else (" (GitHub 로그인 필요)" if is_private else ""))
-                    copy_url  = gh_web if is_private else raw_link
-                    copy_note = "(private: 로그인 필요)" if is_private else ""
+                        raw_link = f["raw_url"]
+                        gh_web  = f"https://github.com/{owner}/{repo}/blob/{branch}/{f['rel_path']}?raw=1"
+                        try:
+                            if f["size_kb"] <= inline_limit_kb:
+                                _bytes = get_raw_file_bytes(owner, repo, branch, f["rel_path"], token, sha=f.get("sha"))
+                                data_uri = build_data_uri(_bytes)
+                        except Exception:
+                            data_uri = ""
+                        dl_href  = data_uri if data_uri else (gh_web if is_private else raw_link)
+                        dl_title = "다운로드" + ("" if data_uri else (" (GitHub 로그인 필요)" if is_private else ""))
+                        copy_url  = gh_web if is_private else raw_link
+                        copy_note = "(private: 로그인 필요)" if is_private else ""
 
-                    enc = base64.urlsafe_b64encode(f["rel_path"].encode("utf-8")).decode("ascii")
-                    del_qs = f"?del={enc}&ts={int(datetime.datetime.now().timestamp())}"
+                        enc = base64.urlsafe_b64encode(f["rel_path"].encode("utf-8")).decode("ascii")
+                        del_qs = f"?del={enc}&ts={int(datetime.datetime.now().timestamp())}"
 
-                    rows.append(f"""
+                        rows.append(f"""
       <div class="row" data-del="{_html.escape(del_qs)}" title="{_html.escape(f['name'])}">
         <div class="name">{_html.escape(f['name'])}</div>
         <div class="size">{f['size_kb']} KB</div>
@@ -499,159 +503,161 @@ with tab1:
           </button>
         </div>
       </div>
-                    """.strip())
+                        """.strip())
 
-                list_html = "\n".join(rows)
-                comp_height = max(72, min(800, 16 + 64 * len(rows)))  # 초기 높이(이후 JS가 자동 보정)
+                    list_html = "\n".join(rows)
+                    # 행 높이 컴팩트해졌으니 예상 높이 보정
+                    comp_height = max(72, min(800, 12 + 56 * len(rows)))
 
-                st_html(f"""
+                    HTML_TEMPLATE = Template(r"""
 <!DOCTYPE html>
 <html><head><meta charset="utf-8" />
 <style>
-  :root {{ --gap: 8px; --btn: 36px; }}
-  html, body {{ margin:0; padding:0; width:100%; }}
-  .wrap {{ width:100%; box-sizing:border-box; }}
-  .row {{
+  :root { --gap: 6px; --btn: 32px; }
+  html, body { margin:0; padding:0; width:100%; }
+  .wrap { width:100%; box-sizing:border-box; }
+  .row {
     width: 100%;
     box-sizing: border-box;
-    margin: 8px 0;
-    padding: 8px 10px;
+    margin: 6px 0;
+    padding: 6px 10px;
     border: 1px solid #e5e7eb;
-    border-radius: 16px;
+    border-radius: 12px;
     background: #fff;
     display: grid;
     grid-template-columns: minmax(0,1fr) auto auto;
     column-gap: var(--gap);
     align-items: center;
-  }}
-  .name {{
+  }
+  .name {
     min-width: 0;
-    font-size: 1rem;
+    font-size: .98rem;
     color:#111827;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-  }}
-  .size {{ color:#6b7280; text-align:right; padding-right:2px; }}
-  @media (max-width: 420px) {{ .size {{ display:none; }} }}
-  .btns {{ display:flex; gap:6px; align-items:center; }}
-  .btn {{
+  }
+  .size { color:#6b7280; text-align:right; padding-right:2px; font-size:.9rem; }
+  @media (max-width: 420px) { .size { display:none; } }
+  .btns { display:flex; gap:6px; align-items:center; }
+  .btn {
     width: var(--btn); height: var(--btn);
     display:flex; align-items:center; justify-content:center;
     border-radius: 10px; border: 1px solid #e5e7eb;
     background:#f9fafb; cursor:pointer; text-decoration:none;
     box-sizing: border-box;
-  }}
-  .btn:hover {{ background:#eef2ff; border-color:#c7d2fe; }}
-  .btn:active {{ transform: translateY(1px); }}
-  .btn svg {{ stroke:#2563eb; width:18px; height:18px; }}
+  }
+  .btn:hover { background:#eef2ff; border-color:#c7d2fe; }
+  .btn:active { transform: translateY(1px); }
+  .btn svg { stroke:#2563eb; width:16px; height:16px; }
 </style>
 </head>
 <body>
   <div class="wrap" id="rows">
-{list_html}
+$LIST_HTML
     <iframe id="bg" style="display:none"></iframe>
   </div>
 
 <script>
-(function() {{
+(function() {
   const rows = document.getElementById('rows');
   const bg = document.getElementById('bg');
 
-  function setHeights(px) {{
-    try {{
+  function setHeights(px) {
+    try {
       const ifr = window.frameElement;
       if (!ifr) return;
       ifr.style.height = px + 'px';
       ifr.setAttribute('height', String(px));
       const p1 = ifr.parentElement;
-      if (p1) {{
+      if (p1) {
         p1.style.height = px + 'px';
         p1.style.minHeight = px + 'px';
         p1.style.maxHeight = px + 'px';
-      }}
+      }
       let e = p1;
-      for (let i=0; i<6 && e; i++) {{
-        if (e.classList && (e.classList.contains('stElementContainer') || e.classList.contains('element-container'))) {{
+      for (let i=0; i<6 && e; i++) {
+        if (e.classList && (e.classList.contains('stElementContainer') || e.classList.contains('element-container'))) {
           e.style.height = px + 'px';
           e.style.minHeight = px + 'px';
           e.style.maxHeight = px + 'px';
           break;
-        }}
+        }
         e = e.parentElement;
-      }}
-    }} catch(_) {{}}
-  }}
-  function adjustHeight() {{
+      }
+    } catch(_) {}
+  }
+  function adjustHeight() {
     const h = Math.ceil(rows.getBoundingClientRect().height) + 8;
     setHeights(h);
-  }}
+  }
   window.addEventListener('load', adjustHeight);
   const ro = new ResizeObserver(() => adjustHeight());
   ro.observe(rows);
-  if (document.fonts && document.fonts.ready) {{
-    document.fonts.ready.then(adjustHeight).catch(()=>{{}});
-  }}
+  if (document.fonts && document.fonts.ready) {
+    document.fonts.ready.then(adjustHeight).catch(()=>{});
+  }
 
-  rows.addEventListener('click', async (e) => {{
+  rows.addEventListener('click', async (e) => {
     const btn = e.target.closest('.btn.copy');
     if (!btn) return;
     const url = btn.getAttribute('data-copy') || '';
-    try {{
+    try {
       await navigator.clipboard.writeText(url);
       btn.style.background = '#dcfce7'; btn.style.borderColor = '#86efac';
-    }} catch(e) {{
+    } catch(e) {
       btn.style.background = '#fee2e2'; btn.style.borderColor = '#fecaca';
-    }} finally {{
-      setTimeout(() => {{ btn.style.background=''; btn.style.borderColor=''; }}, 800);
-    }}
-  }});
+    } finally {
+      setTimeout(() => { btn.style.background=''; btn.style.borderColor=''; }, 800);
+    }
+  });
 
-  rows.addEventListener('click', (e) => {{
+  rows.addEventListener('click', (e) => {
     const btn = e.target.closest('.btn.delete');
     if (!btn) return;
     const del = btn.getAttribute('data-del');
     if (!del) return;
 
     let target = '';
-    try {{
+    try {
       const topLoc = window.top.location;
       const u = new URL(topLoc.origin + topLoc.pathname);
       const delUrl = new URL(del, topLoc.origin);
       u.searchParams.set('del', delUrl.searchParams.get('del'));
       u.searchParams.set('ts', Date.now().toString());
       target = u.toString();
-    }} catch(_) {{
+    } catch(_) {
       const here = new URL(window.location.href);
       here.search = ''; here.pathname = '/';
       here.searchParams.set('del', (new URL(del, window.location.origin)).searchParams.get('del'));
       here.searchParams.set('ts', Date.now().toString());
       target = here.toString();
-    }}
+    }
 
     const row = btn.closest('.row');
-    if (row) {{
+    if (row) {
       row.style.opacity = '0.6';
-      setTimeout(() => {{
+      setTimeout(() => {
         row.remove();
         adjustHeight();
         setTimeout(adjustHeight, 50);
         setTimeout(adjustHeight, 150);
-      }}, 120);
-    }}
+      }, 120);
+    }
 
     const bg = document.getElementById('bg');
     bg.src = target;
-  }});
-}})();
+  });
+})();
 </script>
 </body></html>
-                """, height=comp_height)
-
-            else:
-                st.info("이 폴더에 파일이 없거나 접근할 수 없습니다.")
-        except Exception as e:
-            st.error(f"목록 조회 오류: {e}")
+""")
+                    html_render = HTML_TEMPLATE.substitute(LIST_HTML=list_html)
+                    st_html(html_render, height=comp_height)
+                else:
+                    st.info("이 폴더에 파일이 없거나 접근할 수 없습니다.")
+            except Exception as e:
+                st.error(f"목록 조회 오류: {e}")
 
 # ---------- TAB 2: 메모 ----------
 with tab2:
@@ -661,7 +667,6 @@ with tab2:
     memo_filename = path_join(memo_folder, "memo.md")
     st.caption(f"메모 저장 위치: `{memo_filename}`")
 
-    # ----- 최초 1회 자동 불러오기 -----
     if ready and not st.session_state._memo_autoloaded:
         try:
             sha, info = get_file_sha_if_exists(owner, repo, branch, memo_filename, token)
@@ -704,7 +709,6 @@ with tab2:
 
     st.text_area("여기에 붙여넣고 저장하세요 (Markdown)", key="memo_area", height=220)
 
-    # 버튼 줄 (가운데 '불러오기' 컬럼을 넓힘)
     st.markdown('<div class="memo-btn-row">', unsafe_allow_html=True)
     c1, c2, c3, _sp = st.columns([0.12, 0.22, 0.12, 1], gap="small")
     with c1:
@@ -767,119 +771,121 @@ with tab3:
         )
     chips_html = "\n".join(labels_html) if labels_html else '<span class="empty">등록된 스니펫이 없습니다</span>'
 
-    st_html(f"""
+    SNIP_TEMPLATE = Template(r"""
 <!DOCTYPE html>
 <html><head><meta charset="utf-8"/>
 <style>
-  .bar {{
+  .bar {
     width:100%; box-sizing:border-box; padding:8px 4px;
     white-space: nowrap; overflow-x: auto; overflow-y: hidden;
     border: 1px dashed #e5e7eb; border-radius: 12px; background:#fff;
-  }}
-  .chip {{
+  }
+  .chip {
     display:inline-flex; align-items:center;
     height:36px; max-width: 280px;
     padding: 0 12px; margin-right:8px;
     border-radius: 10px; border:1px solid #e5e7eb;
     background:#f9fafb; cursor:grab; user-select:none;
-  }}
-  .chip:hover {{ background:#eef2ff; border-color:#c7d2fe; }}
-  .chip:active {{ cursor:grabbing; }}
-  .chip.dragging {{ opacity:.6; border-style:dashed; }}
-  .chip .txt {{ white-space: nowrap; overflow:hidden; text-overflow: ellipsis; }}
-  .empty {{ color:#9ca3af; margin-left:4px; }}
+  }
+  .chip:hover { background:#eef2ff; border-color:#c7d2fe; }
+  .chip:active { cursor:grabbing; }
+  .chip.dragging { opacity:.6; border-style:dashed; }
+  .chip .txt { white-space: nowrap; overflow:hidden; text-overflow: ellipsis; }
+  .empty { color:#9ca3af; margin-left:4px; }
 </style>
 </head>
 <body>
   <div class="bar" id="snip-bar">
-    {chips_html}
+    $CHIPS_HTML
     <iframe id="snip-bg" style="display:none"></iframe>
   </div>
 <script>
-(function(){{
+(function(){
   const bar = document.getElementById("snip-bar");
   const bg  = document.getElementById("snip-bg");
   let dragging = null;
 
-  function chipEls() {{ return Array.from(bar.querySelectorAll('.chip')); }}
+  function chipEls() { return Array.from(bar.querySelectorAll('.chip')); }
 
-  function getAfterElement(container, x) {{
+  function getAfterElement(container, x) {
     const els = chipEls().filter(el => el !== dragging);
-    let closest = {{offset: Number.NEGATIVE_INFINITY, element: null}};
-    els.forEach(el => {{
+    let closest = {offset: Number.NEGATIVE_INFINITY, element: null};
+    els.forEach(el => {
       const box = el.getBoundingClientRect();
       const offset = x - (box.left + box.width/2);
-      if (offset < 0 && offset > closest.offset) {{
-        closest = {{offset, element: el}};
-      }}
-    }});
+      if (offset < 0 && offset > closest.offset) {
+        closest = {offset, element: el};
+      }
+    });
     return closest.element;
-  }}
+  }
 
-  bar.addEventListener('dragstart', (e) => {{
+  bar.addEventListener('dragstart', (e) => {
     const chip = e.target.closest('.chip');
     if (!chip) return;
     dragging = chip;
     chip.classList.add('dragging');
     e.dataTransfer.effectAllowed = 'move';
-    try {{ e.dataTransfer.setData('text/plain', chip.getAttribute('data-t') || ''); }} catch(_) {{}}
-  }});
+    try { e.dataTransfer.setData('text/plain', chip.getAttribute('data-t') || ''); } catch(_) {}
+  });
 
-  bar.addEventListener('dragover', (e) => {{
+  bar.addEventListener('dragover', (e) => {
     if (!dragging) return;
     e.preventDefault();
     const after = getAfterElement(bar, e.clientX);
     if (after == null) bar.appendChild(dragging);
     else bar.insertBefore(dragging, after);
-  }});
+  });
 
-  bar.addEventListener('dragend', () => {{
+  bar.addEventListener('dragend', () => {
     if (!dragging) return;
     dragging.classList.remove('dragging');
     dragging = null;
 
     const chips = chipEls();
-    const arr = chips.map(el => {{
+    const arr = chips.map(el => {
       const t = el.getAttribute('data-t') || '';
       const hint = el.getAttribute('data-hint') || '';
-      return hint ? {{t, hint}} : {{t}};
-    }});
-    try {{
+      return hint ? {t, hint} : {t};
+    });
+    try {
       const json = JSON.stringify(arr);
       const b64 = btoa(unescape(encodeURIComponent(json)));
       bg.src = "?snip_reorder=" + encodeURIComponent(b64) + "&ts=" + Date.now();
-    }} catch(e) {{}}
-  }});
+    } catch(e) {}
+  });
 
-  bar.addEventListener("click", async (e) => {{
+  bar.addEventListener("click", async (e) => {
     const btn = e.target.closest(".chip");
     if(!btn) return;
     const raw = btn.getAttribute("data-t") || "";
-    try {{
+    try {
       await navigator.clipboard.writeText(raw);
       btn.style.background = "#dcfce7"; btn.style.borderColor = "#86efac";
-    }} catch(err) {{
+    } catch(err) {
       btn.style.background = "#fee2e2"; btn.style.borderColor = "#fecaca";
-    }} finally {{
-      setTimeout(()=>{{ btn.style.background=''; btn.style.borderColor=''; }}, 800);
-    }}
-  }});
+    } finally {
+      setTimeout(()=>{ btn.style.background=''; btn.style.borderColor=''; }, 800);
+    }
+  });
 
-  bar.addEventListener("contextmenu", (e) => {{
+  bar.addEventListener("contextmenu", (e) => {
     const btn = e.target.closest(".chip");
     if(!btn) return;
     e.preventDefault();
     const idx = btn.getAttribute("data-idx");
-    try {{
+    try {
       btn.style.opacity = "0.5";
       bg.src = "?snip_del=" + encodeURIComponent(idx) + "&ts=" + Date.now();
-      setTimeout(()=>{{ btn.remove(); }}, 120);
-    }} catch(err) {{}}
-  }});
-}})();
+      setTimeout(()=>{ btn.remove(); }, 120);
+    } catch(err) {}
+  });
+})();
 </script>
 </body></html>
-""", height=100)
+""")
+
+    st_html(SNIP_TEMPLATE.substitute(CHIPS_HTML=chips_html), height=100)
 
     st.caption("위: 스니펫 — 드래그로 순서 변경 · 클릭=복사 · 우클릭=삭제 · '제목:내용' 입력 시 제목은 툴팁, 내용은 버튼 라벨/복사값")
 
