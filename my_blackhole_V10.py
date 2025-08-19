@@ -1,7 +1,8 @@
+# my_blackhole.py
 import base64
 import datetime
 import os
-from typing import Optional, Tuple, List, Union
+from typing import Optional, Tuple, List, Union, Dict, Any
 
 import requests
 import streamlit as st
@@ -45,7 +46,7 @@ def gh_raw_base(owner: str, repo: str, branch: str) -> str:
 
 def request_kwargs():
     ca_path = st.secrets.get("CA_BUNDLE_PATH", "")
-    verify = ca_path if ca_path else False  # 내부망 테스트 외엔 CA_BUNDLE_PATH 권장
+    verify = ca_path if ca_path else False
     http_proxy  = st.secrets.get("HTTP_PROXY", "")
     https_proxy = st.secrets.get("HTTPS_PROXY", "")
     no_proxy    = st.secrets.get("NO_PROXY", "")
@@ -215,7 +216,6 @@ st.markdown(
       .stApp iframe { width: 100% !important; min-width: 100% !important; display: block !important; }
       .stApp div:has(> iframe) { width: 100% !important; }
 
-      /* 좌/우 라벨 통일 */
       .section-label{
         display:flex; align-items:center; gap:.4rem;
         font-weight:600; font-size:.95rem; line-height:1.15;
@@ -223,7 +223,6 @@ st.markdown(
       }
       .section-label .ico{ font-size:1.05rem; line-height:1; }
 
-      /* 드롭존 */
       div[data-testid="stFileDropzone"] { min-height: 160px; }
       div[data-testid="stFileUploader"] section[tabindex="0"] { min-height: 160px; padding: .9rem .9rem; }
       section[data-testid="stFileUploadDropzone"] { min-height: 160px; }
@@ -258,6 +257,11 @@ def _init_state():
         ss.snippet_folder = ensure_folder_path(
             st.secrets.get("SNIPPET_FOLDER", path_join("my-blackhole", "_snippets"))
         )
+    if "playlist_folder" not in ss:
+        ss.playlist_folder = ensure_folder_path(
+            st.secrets.get("PLAYLIST_FOLDER", path_join("my-blackhole", "_playlists"))
+        )
+
     if "inline_dl_limit_mb" not in ss:
         ss.inline_dl_limit_mb = float(st.secrets.get("INLINE_DL_LIMIT_MB", 10))
 
@@ -267,6 +271,12 @@ def _init_state():
     if "_snip_clear" not in ss: ss._snip_clear = False
 
     if "_memo_autoloaded" not in ss: ss._memo_autoloaded = False
+
+    # 노동요 탭 임시 상태
+    if "_show_add_to_other" not in ss: ss._show_add_to_other = False
+    if "_pending_track" not in ss: ss._pending_track = None
+    if "_show_save_prompt" not in ss: ss._show_save_prompt = False
+    if "_recent_saved_msg" not in ss: ss._recent_saved_msg = ""
 
 _init_state()
 
@@ -281,6 +291,8 @@ def _settings_panel():
             st.text_input("Repository", key="gh_repo", value=st.session_state.gh_repo)
             st.text_input("메모 폴더 (repo 내 경로)", key="memo_folder", value=st.session_state.memo_folder,
                           help="예: my_blackhole/_memo")
+            st.text_input("플레이리스트 폴더 (repo 내 경로)", key="playlist_folder", value=st.session_state.playlist_folder,
+                          help="예: my-blackhole/_playlists")
         with c2:
             st.text_input("Branch", key="gh_branch", value=st.session_state.gh_branch)
             st.text_input("저장 폴더 (repo 내 경로)", key="folder", value=st.session_state.folder,
@@ -311,7 +323,7 @@ token = st.secrets.get("GH_TOKEN", "")
 ready = bool(token and owner and repo and branch)
 
 # =============================
-# URL query handlers (파일 삭제 + 스니펫 삭제/정렬)
+# URL query handlers (파일/스니펫)
 # =============================
 try:
     qs = st.query_params
@@ -386,7 +398,7 @@ except Exception:
     pass
 
 # =============================
-# (신규) 노동요 탭: YouTube 오디오 플레이어 헬퍼
+# (신규) 노동요 탭: YouTube 오디오 플레이어 + 플레이리스트 저장/불러오기
 # =============================
 
 YOUTUBE_ID_PATTERNS = [
@@ -422,22 +434,21 @@ class Track:
     duration: Optional[int]
     thumbnail_url: str
     audio_url: Optional[str] = None
+    audio_proto: Optional[str] = None  # 'https' / 'm3u8' / ...
 
 @st.cache_data(show_spinner=False)
 def get_metadata_by_yt_dlp(video_id: str):
+    """Cloud 환경 대비: 직결 오디오 우선, 없으면 HLS(m3u8) 허용."""
     if ytdlp is None:
         return None
     url = f"https://www.youtube.com/watch?v={video_id}"
     ydl_opts = {
-        "quiet": True,
-        "skip_download": True,
-        "no_warnings": True,
-        "format": "bestaudio/best",
-        "noplaylist": True,
-        "extract_flat": False,
-        "geo_bypass": True,
-        "default_search": "ytsearch",
-        "nocheckcertificate": True,  # SSL 우회(사내 프록시 등)
+        "quiet": True, "skip_download": True, "no_warnings": True,
+        "format": "bestaudio/best", "noplaylist": True, "extract_flat": False,
+        "geo_bypass": True, "nocheckcertificate": True,
+        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+        "concurrent_fragment_downloads": 1,
+        "http_headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
     }
     try:
         with ytdlp.YoutubeDL(ydl_opts) as ydl:
@@ -449,24 +460,57 @@ def get_metadata_by_yt_dlp(video_id: str):
             thumb = info.get("thumbnail")
             if not thumb:
                 thumbs = info.get("thumbnails") or []
-                if thumbs:
-                    thumb = thumbs[-1].get("url")
+                if thumbs: thumb = thumbs[-1].get("url")
             thumb = thumb or f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
 
             fmts = info.get("formats") or []
-            audio_url = None
-            for f in fmts:
-                if f.get("vcodec") == "none" and f.get("acodec") not in (None, "none") and f.get("url"):
-                    audio_url = f["url"]; break
-            if not audio_url:
+
+            def score(f):
+                ext = (f.get("ext") or "").lower()
+                abr = f.get("abr") or 0
+                proto = (f.get("protocol") or "").lower()
+                is_direct = proto in ("http", "https")
+                is_audio = (f.get("vcodec") == "none") and (f.get("acodec") not in (None, "none"))
+                ext_boost = 3 if ext in ("m4a","mp4") else (2 if ext in ("webm","opus") else 0)
+                return (100 if is_audio else 0) + (50 if is_direct else 0) + ext_boost + abr
+
+            best = None
+            # 1) 직결(https) 오디오만 먼저
+            for f in sorted(fmts, key=score, reverse=True):
+                proto = (f.get("protocol") or "").lower()
+                if proto not in ("http", "https"):
+                    continue
+                if f.get("vcodec") == "none" and f.get("acodec") not in (None,"none") and f.get("url"):
+                    best = f; break
+
+            # 2) 보조: HLS(m3u8)
+            if not best:
                 for f in fmts:
-                    if f.get("acodec") not in (None, "none") and f.get("url"):
-                        audio_url = f["url"]; break
-            if not audio_url:
-                audio_url = info.get("url")
-            if not audio_url:
+                    proto = (f.get("protocol") or "").lower()
+                    if proto in ("m3u8", "m3u8_native") and f.get("url"):
+                        best = f; break
+
+            # 3) 더 보조
+            if not best:
+                for f in sorted(fmts, key=score, reverse=True):
+                    if f.get("acodec") not in (None,"none") and f.get("url"):
+                        best = f; break
+
+            if not best and info.get("requested_formats"):
+                for f in info["requested_formats"]:
+                    if f.get("url"):
+                        best = f; break
+
+            if not best and info.get("url"):
+                best = {"url": info["url"], "protocol": "https"}
+
+            if not best or not best.get("url"):
                 return None
-            return {"title": title, "duration": duration, "thumbnail": thumb, "audio_url": audio_url}
+
+            audio_url = best["url"]
+            proto = (best.get("protocol") or "").lower()
+            return {"title": title, "duration": duration, "thumbnail": thumb,
+                    "audio_url": audio_url, "protocol": proto}
     except Exception:
         return None
 
@@ -483,7 +527,7 @@ def get_metadata_by_pytube(video_id: str):
         audio_url = getattr(audio_stream, "url", None)
         if not audio_url:
             return None
-        return {"title": title, "duration": duration, "thumbnail": thumb, "audio_url": audio_url}
+        return {"title": title, "duration": duration, "thumbnail": thumb, "audio_url": audio_url, "protocol": "https"}
     except Exception:
         return None
 
@@ -499,6 +543,7 @@ def resolve_track(video_id: str) -> Optional[Track]:
         duration=meta.get("duration"),
         thumbnail_url=meta.get("thumbnail") or f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
         audio_url=meta.get("audio_url"),
+        audio_proto=(meta.get("protocol") or ("https" if (meta.get("audio_url") or "").startswith("https") else None)),
     )
 
 def _elapsed_now() -> float:
@@ -514,25 +559,156 @@ def _playlist_total_secs(tracks: List[Track]) -> int:
 def _sum_before_index(tracks: List[Track], idx: int) -> int:
     return sum(int(t.duration or 0) for t in tracks[:max(0, min(idx, len(tracks)))])
 
-def render_labor_song_tab():
-    # 스타일 (탭 내부)
-    CUSTOM_CSS = """
-    <style>
-    :root { --accent: #5B6CFF; }
-    html, body, [class*="css"] { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; }
-    .playing-badge { display: inline-block; padding: 2px 8px; font-size: 12px; border-radius: 999px; background: var(--accent); color: white; margin-left: 8px; }
-    .playlist-thumb { width: 56px; height: 56px; border-radius: 10px; object-fit: cover; border: 1px solid rgba(0,0,0,0.06); }
-    .playlist-title { font-weight: 600; }
-    .playlist-meta { font-size: 12px; color: #666; margin-bottom: 8px; line-height: 1.25; }
-    .time-pill { padding:4px 10px; border-radius:999px; background:#f3f4f6; font-size:12px; color:#111; }
-    hr.soft { border: none; border-top: 1px dashed #e5e7eb; margin: 12px 0; }
-    .small {font-size:12px; color:#777}
-    </style>
-    """
-    st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+# ---------- 플레이리스트 저장/불러오기/삭제 유틸 ----------
+SAFE_FILENAME_RX = re.compile(r"[^0-9A-Za-z가-힣 _\-\.\(\)]+")
+def _sanitize_filename(name: str) -> str:
+    s = SAFE_FILENAME_RX.sub("_", name.strip())
+    s = s.strip(" ._")
+    return s or "playlist"
 
+def _pl_folder_primary() -> str:
+    return ensure_folder_path(st.session_state.playlist_folder)
+
+def _pl_folder_legacy_candidates() -> List[str]:
+    legacy = []
+    alt = ensure_folder_path(st.secrets.get("LABOR_PLAYLIST_FOLDER", "my-blackhole/_labor_playlists"))
+    if alt and alt != _pl_folder_primary():
+        legacy.append(alt)
+    return legacy
+
+def _pl_path(folder: str, name: str) -> str:
+    return path_join(folder, _sanitize_filename(name) + ".json")
+
+def _serialize_track(t: Track) -> Dict[str, Any]:
+    return {
+        "video_id": t.video_id,
+        "title": t.title,
+        "duration": int(t.duration or 0),
+        "thumbnail_url": t.thumbnail_url,
+    }
+
+def _deserialize_tracks(payload: Any) -> List[Track]:
+    arr = []
+    if isinstance(payload, dict):
+        payload = payload.get("tracks") or []
+    if isinstance(payload, list):
+        for x in payload:
+            try:
+                vid = str(x.get("video_id", ""))
+                arr.append(Track(
+                    video_id=vid,
+                    title=str(x.get("title", f"Video {vid}")),
+                    duration=int(x.get("duration") or 0),
+                    thumbnail_url=str(x.get("thumbnail_url") or f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"),
+                    audio_url=None,
+                    audio_proto=None
+                ))
+            except Exception:
+                continue
+    return arr
+
+def save_current_playlist_to_repo(name: str) -> Tuple[bool, str]:
+    if not ready:
+        return False, "GitHub 설정이 완료되지 않았습니다."
+    name = name.strip()
+    if not name:
+        return False, "이름을 입력하세요."
+    folder_pl = _pl_folder_primary()
+    fname = _sanitize_filename(name) + ".json"
+    path = path_join(folder_pl, fname)
+
+    pl = st.session_state.get("playlist", []) or []
+    data = {
+        "name": name,
+        "saved_at": datetime.datetime.now().isoformat(),
+        "current_index": int(st.session_state.get("current_index", 0)),
+        "tracks": [_serialize_track(t) for t in pl],
+    }
+    body = _json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+    sha, _ = get_file_sha_if_exists(owner, repo, branch, path, token)
+    put_file(owner, repo, branch, path, body, token, f"Save playlist: {name}", sha)
+    return True, f"저장 완료: {name}"
+
+def list_saved_playlists() -> List[dict]:
+    if not ready:
+        return []
+    seen = {}
+    def _collect(folder: str):
+        try:
+            items = list_folder(owner, repo, branch, folder, token)
+            for it in items:
+                if it.get("type") == "file" and str(it.get("name","")).lower().endswith(".json"):
+                    key = it.get("path")
+                    seen[key] = {
+                        "name": it.get("name"),
+                        "path": it.get("path"),
+                        "size": it.get("size", 0),
+                        "sha": it.get("sha"),
+                        "folder": folder,
+                    }
+        except Exception:
+            pass
+    _collect(_pl_folder_primary())
+    for f in _pl_folder_legacy_candidates():
+        _collect(f)
+    rows = list(seen.values())
+    rows.sort(key=lambda x: x["name"].lower())
+    return rows
+
+def load_playlist_from_repo(path: str) -> Tuple[bool, str]:
+    if not ready:
+        return False, "GitHub 설정이 완료되지 않았습니다."
+    try:
+        raw = get_raw_file_bytes(owner, repo, branch, path, token)
+        data = _json.loads(raw.decode("utf-8", errors="replace"))
+        tracks = _deserialize_tracks(data)
+        st.session_state.playlist = tracks
+        st.session_state.current_index = int(data.get("current_index", 0)) if tracks else 0
+        st.session_state.elapsed_acc = 0.0
+        st.session_state.play_start_ts = None
+        st.session_state.is_playing = False
+        return True, f"불러오기 완료: {os.path.basename(path)}"
+    except Exception as e:
+        return False, f"불러오기 실패: {e}"
+
+def append_track_to_playlist_path(path: str, tr: Track) -> Tuple[bool, str]:
+    if not ready:
+        return False, "GitHub 설정이 완료되지 않았습니다."
+    try:
+        sha, info = get_file_sha_if_exists(owner, repo, branch, path, token)
+        cur_tracks: List[Track] = []
+        meta = {"name": os.path.splitext(os.path.basename(path))[0]}
+        if info and info.get("content"):
+            decoded = base64.b64decode(info["content"]).decode("utf-8", errors="replace")
+            data = _json.loads(decoded)
+            cur_tracks = _deserialize_tracks(data)
+            if isinstance(data, dict) and "name" in data:
+                meta["name"] = data["name"]
+        cur_tracks.append(tr)
+        body_obj = {
+            **meta,
+            "updated": datetime.datetime.utcnow().isoformat() + "Z",
+            "tracks": [_serialize_track(t) for t in cur_tracks]
+        }
+        body = _json.dumps(body_obj, ensure_ascii=False, indent=2).encode("utf-8")
+        put_file(owner, repo, branch, path, body, token, f"Append track to playlist: {meta['name']}", sha)
+        return True, f"추가 완료: {meta['name']}"
+    except Exception as e:
+        return False, f"추가 실패: {e}"
+
+def delete_playlist_by_path(path: str) -> Tuple[bool, str]:
+    if not ready:
+        return False, "GitHub 설정이 완료되지 않았습니다."
+    try:
+        delete_file(owner, repo, branch, path, token, f"Delete playlist: {os.path.basename(path)}")
+        return True, "삭제 완료"
+    except Exception as e:
+        return False, f"삭제 실패: {e}"
+
+# ---------- 렌더링 ----------
+def render_labor_song_tab():
     st.header("④ 노동요")
-    st.caption("YouTube 오디오 재생 · 간단 플레이리스트 (플레이어 UI 숨김)")
+    st.caption("YouTube 오디오 재생 · 간단 플레이리스트")
 
     # 세션 상태 초기화
     if "playlist" not in st.session_state:
@@ -548,220 +724,378 @@ def render_labor_song_tab():
     if "elapsed_acc" not in st.session_state:
         st.session_state.elapsed_acc = 0.0
 
-    # 곡 추가
-    with st.expander("➕ 곡 추가", expanded=False):
-        with st.form("add_form", clear_on_submit=True):
-            url = st.text_input("YouTube URL 또는 영상 ID", key="url_input", placeholder="https://www.youtube.com/watch?v=...")
-            submit = st.form_submit_button("추가", type="primary")
+    # ====== 2단 레이아웃 ======
+    left, right = st.columns([0.43, 0.57], vertical_alignment="top")
 
-        if submit and url.strip():
-            vid = extract_video_id(url)
-            if not vid:
-                st.warning("유효한 YouTube URL/ID가 아닙니다.")
-            else:
-                with st.spinner("메타데이터 가져오는 중..."):
-                    tr = resolve_track(vid)
-                if not tr or not tr.audio_url:
-                    st.error("오디오 스트림을 찾을 수 없습니다. 다른 URL을 시도해 보세요.")
+    # ---------------- Right (상단: 곡 추가, 그 아래 현재 플레이리스트) ----------------
+    with right:
+        # 곡 추가(오른쪽 상단)
+        with st.expander("➕ 곡 추가", expanded=False):
+            # 폼 제출 후 항상 초기화되도록 clear_on_submit=True
+            with st.form("add_form", clear_on_submit=True):
+                url = st.text_input("YouTube URL 또는 영상 ID", key="url_input", placeholder="https://www.youtube.com/watch?v=...")
+                c_add, c_other, _sp = st.columns([0.12, 0.12, 1])
+                submit_add   = c_add.form_submit_button("➕", type="primary", help="현재 플레이리스트에 추가")
+                submit_other = c_other.form_submit_button("📥", help="저장된 다른 재생목록의 마지막에 추가")
+
+            # 현재 목록에 추가
+            if submit_add and (url or "").strip():
+                vid = extract_video_id(url)
+                if not vid:
+                    st.warning("유효한 YouTube URL/ID가 아닙니다.")
                 else:
-                    st.session_state.playlist.append(tr)
-                    if len(st.session_state.playlist) == 1:
-                        st.session_state.current_index = 0
-                    st.success(f"추가 완료: {tr.title}")
-                    st.rerun()
-
-    st.markdown("<hr class='soft'>", unsafe_allow_html=True)
-
-    # 플레이리스트 헤더
-    pl = st.session_state.playlist
-    idx = st.session_state.current_index
-
-    h1, h2, h3 = st.columns([7, 0.6, 2.0])
-    h1.subheader("▶ 플레이리스트", anchor=False)
-
-    play_icon = "⏸" if st.session_state.is_playing else "⏵"
-    if h2.button(play_icon, help="재생/일시정지"):
-        if st.session_state.is_playing:
-            st.session_state.elapsed_acc = _elapsed_now()
-            st.session_state.play_start_ts = None
-            st.session_state.is_playing = False
-        else:
-            st.session_state.play_start_ts = time.time()
-            st.session_state.is_playing = True
-        st.session_state.audio_nonce += 1
-        st.rerun()
-
-    TOTAL_SECS = _playlist_total_secs(pl)
-    BEFORE_SECS = _sum_before_index(pl, idx)
-    START_AT = int(_elapsed_now()) if (st.session_state.is_playing and pl) else 0
-
-    if pl and st.session_state.is_playing:
-        cur = pl[idx]
-        fresh = resolve_track(cur.video_id)
-        if fresh and fresh.audio_url:
-            cur.audio_url = fresh.audio_url
-
-        # ★ JS 템플릿 리터럴 ${...} → $${...}로 이스케이프해 KeyError 방지
-        audio_tpl = Template("""
-        <div style="display:flex; justify-content:flex-end; align-items:center;">
-          <span id="hdr-pill" class="time-pill" style="margin-left:auto">0:00 / ${total_str}</span>
-        </div>
-        <audio id="ytap-audio" src="${src}" autoplay style="display:none"></audio>
-        <script>
-          (function() {
-            var audio = document.getElementById('ytap-audio');
-            var pill = document.getElementById('hdr-pill');
-            var before = ${before};
-            var total = ${total};
-            var startAt = ${startAt};
-            var bc = new BroadcastChannel('ytap');
-            function fmt(t) {
-              t = Math.max(0, Math.floor(t));
-              var h = Math.floor(t/3600);
-              var m = Math.floor((t%3600)/60);
-              var s = Math.floor(t%60);
-              return h>0 ? `$${h}:$${String(m).padStart(2,'0')}:$${String(s).padStart(2,'0')}`
-                         : `$${m}:$${String(s).padStart(2,'0')}`;
-            }
-            function setStart() { try { audio.currentTime = startAt; } catch(e) {} }
-            function tick() {
-              if (!audio) return;
-              var t = audio.currentTime || 0;
-              if (pill) pill.textContent = fmt(before + t) + " / " + fmt(total);
-              try { bc.postMessage({ t: t }); } catch(e) {}
-            }
-            if (audio.readyState >= 1) { setStart(); } else { audio.addEventListener('loadedmetadata', setStart, { once: true }); }
-            var p = audio.play(); if (p && p.catch) p.catch(function(){});
-            clearInterval(window.__ytap_header_timer__);
-            window.__ytap_header_timer__ = setInterval(tick, 200);
-            tick();
-          })();
-        </script>
-        """)
-        audio_html = audio_tpl.substitute(
-            total_str=format_duration(TOTAL_SECS),
-            src=f"{cur.audio_url}?n={st.session_state.audio_nonce}",
-            before=BEFORE_SECS,
-            total=TOTAL_SECS,
-            startAt=START_AT,
-        )
-        st_html(audio_html, height=48, scrolling=False)
-    else:
-        h3.markdown(
-            f"<div style='text-align:right'><span class='time-pill'>{format_duration(BEFORE_SECS if not st.session_state.is_playing else 0)} / {format_duration(TOTAL_SECS)}</span></div>",
-            unsafe_allow_html=True,
-        )
-
-    st.markdown("<hr class='soft'>", unsafe_allow_html=True)
-
-    # 리스트
-    if not pl:
-        st.info("아직 추가된 곡이 없습니다. 위에 URL을 붙여넣고 **추가**하세요.")
-    else:
-        for i, tr in enumerate(pl):
-            left, mid, right = st.columns([0.6, 6, 2.8])
-            left.image(tr.thumbnail_url, width=56)
-
-            title_html = f"<span class='playlist-title'>{tr.title}</span>"
-            if st.session_state.is_playing and i == idx:
-                title_html += " <span class='playing-badge'>Now Playing</span>"
-            mid.markdown(title_html, unsafe_allow_html=True)
-
-            if st.session_state.is_playing and i == idx:
-                row_total = format_duration(tr.duration)
-                row_tpl = Template("""
-                <style>
-                  .playlist-meta { font-size:12px; color:#666; margin-bottom:8px; line-height:1.25; }
-                </style>
-                <div class='playlist-meta'>
-                  ID: ${vid} · <span id='row-elapsed'>0:00</span> / ${row_total}
-                </div>
-                <script>
-                  (function() {
-                    function fmt(t) {
-                      t = Math.max(0, Math.floor(t));
-                      var h = Math.floor(t/3600);
-                      var m = Math.floor((t%3600)/60);
-                      var s = Math.floor(t%60);
-                      return h>0 ? `$${h}:$${String(m).padStart(2,'0')}:$${String(s).padStart(2,'0')}`
-                                 : `$${m}:$${String(s).padStart(2,'0')}`;
-                    }
-                    var lab = document.getElementById('row-elapsed');
-                    try {
-                      var bc = new BroadcastChannel('ytap');
-                      bc.onmessage = function(ev) {
-                        try {
-                          if (!lab) lab = document.getElementById('row-elapsed');
-                          if (!lab) return;
-                          var t = (ev && ev.data && ev.data.t) ? ev.data.t : 0;
-                          lab.textContent = fmt(t);
-                        } catch(e) {}
-                      };
-                    } catch(e) {}
-                  })();
-                </script>
-                """)
-                row_html = row_tpl.substitute(vid=tr.video_id, row_total=row_total)
-                st_html(row_html, height=36, scrolling=False)
-            else:
-                mid.markdown(
-                    f"<div class='playlist-meta'>ID: {tr.video_id} · 0:00 / {format_duration(tr.duration)}</div>",
-                    unsafe_allow_html=True,
-                )
-
-            # 우측 컨트롤
-            pcol, upcol, downcol, delcol = right.columns([0.9, 0.9, 0.9, 0.9])
-            is_this_playing = st.session_state.is_playing and (i == idx)
-            if pcol.button("⏸" if is_this_playing else "⏵", key=f"play_{i}"):
-                if i == idx:
-                    if st.session_state.is_playing:
-                        st.session_state.elapsed_acc = _elapsed_now()
-                        st.session_state.play_start_ts = None
-                        st.session_state.is_playing = False
+                    with st.spinner("메타데이터 가져오는 중..."):
+                        tr = resolve_track(vid)
+                    if not tr or not tr.audio_url:
+                        st.error("오디오 스트림을 찾을 수 없습니다. 다른 URL을 시도해 보세요.")
                     else:
-                        st.session_state.play_start_ts = time.time()
-                        st.session_state.is_playing = True
+                        st.session_state.playlist.append(tr)
+                        if len(st.session_state.playlist) == 1:
+                            st.session_state.current_index = 0
+                        st.toast(f"추가 완료: {tr.title}")
+                        # 보수적으로 한 번 더 초기화
+                        try: st.session_state["url_input"] = ""
+                        except Exception: pass
+                        st.rerun()
+
+            # 다른 저장 목록에 추가
+            if submit_other and (url or "").strip():
+                vid = extract_video_id(url.strip())
+                if not vid:
+                    st.warning("유효한 YouTube URL/ID가 아닙니다.")
                 else:
-                    st.session_state.current_index = i
-                    st.session_state.elapsed_acc = 0.0
+                    with st.spinner("메타데이터 가져오는 중..."):
+                        tr = resolve_track(vid)
+                    if not tr:
+                        st.error("오디오 정보를 가져올 수 없습니다.")
+                    else:
+                        st.session_state._pending_track = {
+                            "video_id": tr.video_id,
+                            "title": tr.title,
+                            "duration": int(tr.duration or 0),
+                            "thumbnail_url": tr.thumbnail_url,
+                        }
+                        st.session_state._show_add_to_other = True
+
+            # 선택 영역(다른 목록에 추가)
+            if st.session_state._show_add_to_other:
+                with st.container(border=True):
+                    st.markdown("**다른 목록에 추가** · 대상 선택")
+                    rows = list_saved_playlists() if ready else []
+                    if not ready:
+                        st.warning("GitHub 설정을 먼저 완료하세요.")
+                    elif not rows:
+                        st.info("저장된 플레이리스트가 없습니다. 먼저 현재 목록을 저장해 주세요.")
+                    else:
+                        names = [os.path.splitext(r["name"])[0] for r in rows]
+                        sel_idx = st.selectbox("대상 재생목록", list(range(len(names))), format_func=lambda i: names[i], key="add_other_sel_idx")
+                        c_ok, c_cancel = st.columns([0.26, 0.18], gap="small")
+                        if c_ok.button("끝에 추가", type="primary", use_container_width=True):
+                            pend = st.session_state._pending_track or {}
+                            tr = Track(
+                                video_id=pend.get("video_id",""),
+                                title=pend.get("title",""),
+                                duration=pend.get("duration",0),
+                                thumbnail_url=pend.get("thumbnail_url",""),
+                                audio_url=None,
+                                audio_proto=None
+                            )
+                            ok, msg = append_track_to_playlist_path(rows[sel_idx]["path"], tr)
+                            if ok:
+                                st.toast(msg)
+                                st.session_state._show_add_to_other = False
+                                st.session_state._pending_track = None
+                                try: st.session_state["url_input"] = ""  # 입력창 초기화
+                                except Exception: pass
+                                st.rerun()
+                            else:
+                                st.error(msg)
+                        if c_cancel.button("취소", use_container_width=True):
+                            st.session_state._show_add_to_other = False
+                            st.session_state._pending_track = None
+                            st.rerun()
+
+        st.markdown("---")
+
+        # ===== 현재 플레이리스트 헤더 =====
+        h_label, h_clear, h_save, h_play = st.columns([6, 0.9, 0.9, 0.9])
+        with h_label:
+            st.subheader("▶ 플레이리스트", anchor=False)
+
+        # 초기화(🧹) - 저장 왼쪽
+        with h_clear:
+            if st.button("🧹", key="btn_clear_inline", help="현재 화면 플레이리스트 초기화", use_container_width=True):
+                st.session_state.is_playing = False
+                st.session_state.play_start_ts = None
+                st.session_state.elapsed_acc = 0.0
+                st.session_state.current_index = 0
+                st.session_state.playlist = []
+                st.session_state.audio_nonce += 1
+                st.rerun()
+
+        with h_save:
+            if st.button("💾", key="btn_save_inline", use_container_width=True, help="현재 플레이리스트 저장", disabled=not ready):
+                st.session_state._show_save_prompt = True
+                st.rerun()
+
+        with h_play:
+            play_icon = "⏸" if st.session_state.is_playing else "⏵"
+            if st.button(play_icon, help="재생/일시정지", key="hdr_play_btn"):
+                if st.session_state.is_playing:
+                    st.session_state.elapsed_acc = _elapsed_now()
+                    st.session_state.play_start_ts = None
+                    st.session_state.is_playing = False
+                else:
                     st.session_state.play_start_ts = time.time()
                     st.session_state.is_playing = True
                 st.session_state.audio_nonce += 1
                 st.rerun()
 
-            if upcol.button("↑", key=f"up_{i}") and i > 0:
-                st.session_state.elapsed_acc = _elapsed_now()
-                st.session_state.play_start_ts = None
-                st.session_state.is_playing = False
-                pl[i-1], pl[i] = pl[i], pl[i-1]
-                if st.session_state.current_index == i:
-                    st.session_state.current_index -= 1
-                elif st.session_state.current_index == i - 1:
-                    st.session_state.current_index += 1
+        # 저장 프롬프트
+        if st.session_state._show_save_prompt:
+            name_default = datetime.datetime.now().strftime("노동요 %Y-%m-%d %H%M")
+            c_in, c_ok, c_cancel = st.columns([0.60, 0.16, 0.16])
+            pl_name = c_in.text_input("저장 이름", key="pl_save_name_inline", value=name_default, label_visibility="collapsed")
+            if c_ok.button("저장", key="pl_save_ok", type="primary", use_container_width=True):
+                ok, msg = save_current_playlist_to_repo(pl_name)
+                if ok:
+                    st.session_state._recent_saved_msg = msg
+                    st.session_state._show_save_prompt = False
+                    st.toast(msg)
+                    st.rerun()
+                else:
+                    st.error(msg)
+            if c_cancel.button("취소", key="pl_save_cancel", use_container_width=True):
+                st.session_state._show_save_prompt = False
                 st.rerun()
 
-            if downcol.button("↓", key=f"down_{i}") and i < len(pl)-1:
-                st.session_state.elapsed_acc = _elapsed_now()
-                st.session_state.play_start_ts = None
-                st.session_state.is_playing = False
-                pl[i+1], pl[i] = pl[i], pl[i+1]
-                if st.session_state.current_index == i:
-                    st.session_state.current_index += 1
-                elif st.session_state.current_index == i + 1:
-                    st.session_state.current_index -= 1
-                st.rerun()
+        # ===== 시간 표시(상단 pill) + 오디오(재생 중) =====
+        pl = st.session_state.playlist
+        idx = st.session_state.current_index
+        TOTAL_SECS = _playlist_total_secs(pl)
+        BEFORE_SECS = _sum_before_index(pl, idx)
+        CUR_ELAPSED = int(_elapsed_now()) if (pl and 0 <= idx < len(pl)) else 0
+        START_AT = CUR_ELAPSED
 
-            if delcol.button("🗑", key=f"del_{i}"):
-                st.session_state.elapsed_acc = _elapsed_now()
-                st.session_state.play_start_ts = None
-                st.session_state.is_playing = False
-                del pl[i]
-                if st.session_state.current_index >= len(pl):
-                    st.session_state.current_index = max(0, len(pl) - 1)
-                st.rerun()
+        if st.session_state.is_playing and pl:
+            cur = pl[idx]
+            # URL 갱신
+            fresh = resolve_track(cur.video_id)
+            if fresh and fresh.audio_url:
+                cur.audio_url = fresh.audio_url
+                cur.audio_proto = fresh.audio_proto
 
-    st.markdown("<hr class='soft'>", unsafe_allow_html=True)
-    st.markdown("<div class='small'>진행/총시간은 컴포넌트 내부 JS로 실시간 갱신됩니다. 곡 추가 섹션은 기본 접힘 상태입니다.</div>", unsafe_allow_html=True)
+            # HLS 여부 판단
+            use_hls = (cur.audio_proto in ("m3u8", "m3u8_native", "hls")) or (cur.audio_url or "").endswith(".m3u8")
+
+            # 오디오 + 상단 pill (hls.js 자동 사용)
+            header_tpl = Template("""
+            <div style="display:flex;justify-content:flex-end;align-items:center;">
+              <span id="hdr-pill" style="padding:4px 10px;border-radius:999px;background:#f3f4f6;font-size:12px;color:#111">${init_label}</span>
+            </div>
+            <audio id="ytap-audio" style="display:none"></audio>
+            <script>
+              (function() {
+                var audio = document.getElementById('ytap-audio');
+                var pill = document.getElementById('hdr-pill');
+                var before = ${before};
+                var total = ${total};
+                var startAt = ${startAt};
+                var src = ${src_json};
+                var useHLS = ${use_hls};
+
+                function fmt(t){
+                  t = Math.max(0, Math.floor(t));
+                  var h = Math.floor(t/3600), m = Math.floor((t%3600)/60), s = Math.floor(t%60);
+                  return h>0 ? (h+":"+String(m).padStart(2,'0')+":"+String(s).padStart(2,'0'))
+                             : (m+":"+String(s).padStart(2,'0'));
+                }
+                function setStart(){ try { audio.currentTime = startAt; } catch(e){} }
+                function tick(){
+                  var t = audio.currentTime || 0;
+                  if (pill) pill.textContent = fmt(before + t) + " / " + fmt(total);
+                }
+                function boot(){
+                  if (useHLS) {
+                    var s = document.createElement('script');
+                    s.src = "https://cdn.jsdelivr.net/npm/hls.js@1.5.13/dist/hls.min.js";
+                    s.onload = function(){
+                      try{
+                        if (window.Hls && window.Hls.isSupported()) {
+                          var hls = new window.Hls({lowLatencyMode:false, liveDurationInfinity:true});
+                          hls.loadSource(src);
+                          hls.attachMedia(audio);
+                          hls.on(window.Hls.Events.MANIFEST_PARSED, function(){ audio.play && audio.play().catch(()=>{}); });
+                        } else {
+                          audio.src = src;  // 사파리 등 네이티브 HLS
+                          audio.play && audio.play().catch(()=>{});
+                        }
+                      }catch(e){ audio.src = src; audio.play && audio.play().catch(()=>{}); }
+                      setStart();
+                    };
+                    (document.head||document.body).appendChild(s);
+                  } else {
+                    audio.src = src;
+                    audio.play && audio.play().catch(()=>{});
+                    setStart();
+                  }
+                  clearInterval(window.__ytap_header_timer__);
+                  window.__ytap_header_timer__ = setInterval(tick, 200);
+                  tick();
+                }
+                boot();
+              })();
+            </script>
+            """)
+            st_html(header_tpl.substitute(
+                init_label=f"{format_duration(BEFORE_SECS + START_AT)} / {format_duration(TOTAL_SECS)}",
+                src_json=_json.dumps(f"{cur.audio_url}?n={st.session_state.audio_nonce}", ensure_ascii=False),
+                before=BEFORE_SECS, total=TOTAL_SECS, startAt=START_AT,
+                use_hls=str(bool(use_hls)).lower(),
+            ), height=48, scrolling=False)
+        else:
+            # 일시정지/정지 상태: 정적 표시
+            st.markdown(
+                f"<div style='text-align:right'><span style='padding:4px 10px;border-radius:999px;background:#f3f4f6;font-size:12px;color:#111'>{format_duration(BEFORE_SECS + CUR_ELAPSED)} / {format_duration(TOTAL_SECS)}</span></div>",
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("---")
+
+        # ===== 현재 플레이리스트 표 =====
+        if not pl:
+            st.info("아직 추가된 곡이 없습니다. 위의 ➕에서 URL을 붙여넣고 추가하세요.")
+        else:
+            for i, tr in enumerate(pl):
+                left_c, mid_c, right_c = st.columns([0.6, 6, 2.8])
+                left_c.image(tr.thumbnail_url, width=56)
+
+                title_html = f"<span style='font-weight:600'>{tr.title}</span>"
+                if st.session_state.is_playing and i == idx:
+                    title_html += " <span style='display:inline-block;padding:2px 8px;font-size:12px;border-radius:999px;background:#5B6CFF;color:#fff;margin-left:8px'>Now Playing</span>"
+                mid_c.markdown(title_html, unsafe_allow_html=True)
+
+                # --- 행 하단 시간표시 ---
+                if st.session_state.is_playing and i == idx:
+                    # 현재 재생 중인 행만 실시간 로컬 타이머로 갱신 (iframe 간 통신 불필요)
+                    row_total_str = format_duration(tr.duration)
+                    base_at = START_AT
+                    row_tpl = Template("""
+                    <div style="font-size:12px;color:#666;margin-bottom:8px;line-height:1.25">
+                      ID: ${vid} · <span id="row-elapsed">${init_elapsed}</span> / ${row_total}
+                    </div>
+                    <script>
+                      (function() {
+                        function fmt(t){
+                          t = Math.max(0, Math.floor(t));
+                          var h = Math.floor(t/3600), m = Math.floor((t%3600)/60), s = Math.floor(t%60);
+                          return h>0 ? (h+":"+String(m).padStart(2,'0')+":"+String(s).padStart(2,'0'))
+                                     : (m+":"+String(s).padStart(2,'0'));
+                        }
+                        var lab = document.getElementById('row-elapsed');
+                        var base = ${base_at};
+                        var startedAt = Date.now();
+                        function tick(){
+                          var dt = (Date.now() - startedAt) / 1000.0;
+                          var t = base + dt;
+                          if (lab) lab.textContent = fmt(t);
+                        }
+                        clearInterval(window.__ytap_row_timer__);
+                        window.__ytap_row_timer__ = setInterval(tick, 200);
+                        tick();
+                      })();
+                    </script>
+                    """)
+                    st_html(row_tpl.substitute(
+                        vid=tr.video_id,
+                        init_elapsed=format_duration(base_at),
+                        row_total=row_total_str,
+                        base_at=base_at
+                    ), height=36, scrolling=False)
+                else:
+                    # 다른 행은 정적 표기(0부터)
+                    mid_c.markdown(
+                        f"<div style='font-size:12px;color:#666;margin-bottom:8px;line-height:1.25'>ID: {tr.video_id} · 0:00 / {format_duration(tr.duration)}</div>",
+                        unsafe_allow_html=True,
+                    )
+
+                # 오른쪽 컨트롤
+                pcol, upcol, downcol, delcol = right_c.columns([0.9, 0.9, 0.9, 0.9])
+                is_this_playing = st.session_state.is_playing and (i == idx)
+                if pcol.button("⏸" if is_this_playing else "⏵", key=f"play_{i}", help="재생/일시정지"):
+                    if i == idx:
+                        if st.session_state.is_playing:
+                            st.session_state.elapsed_acc = _elapsed_now()
+                            st.session_state.play_start_ts = None
+                            st.session_state.is_playing = False
+                        else:
+                            st.session_state.play_start_ts = time.time()
+                            st.session_state.is_playing = True
+                    else:
+                        st.session_state.current_index = i
+                        st.session_state.elapsed_acc = 0.0
+                        st.session_state.play_start_ts = time.time()
+                        st.session_state.is_playing = True
+                    st.session_state.audio_nonce += 1
+                    st.rerun()
+
+                if upcol.button("↑", key=f"up_{i}", help="위로") and i > 0:
+                    st.session_state.elapsed_acc = _elapsed_now()
+                    st.session_state.play_start_ts = None
+                    st.session_state.is_playing = False
+                    pl[i-1], pl[i] = pl[i], pl[i-1]
+                    if st.session_state.current_index == i:
+                        st.session_state.current_index -= 1
+                    elif st.session_state.current_index == i - 1:
+                        st.session_state.current_index += 1
+                    st.rerun()
+
+                if downcol.button("↓", key=f"down_{i}", help="아래로") and i < len(pl)-1:
+                    st.session_state.elapsed_acc = _elapsed_now()
+                    st.session_state.play_start_ts = None
+                    st.session_state.is_playing = False
+                    pl[i+1], pl[i] = pl[i], pl[i+1]
+                    if st.session_state.current_index == i:
+                        st.session_state.current_index += 1
+                    elif st.session_state.current_index == i + 1:
+                        st.session_state.current_index -= 1
+                    st.rerun()
+
+                if delcol.button("🗑", key=f"del_{i}", help="삭제"):
+                    st.session_state.elapsed_acc = _elapsed_now()
+                    st.session_state.play_start_ts = None
+                    st.session_state.is_playing = False
+                    del pl[i]
+                    if st.session_state.current_index >= len(pl):
+                        st.session_state.current_index = max(0, len(pl) - 1)
+                    st.rerun()
+
+    # ---------------- Left: 저장된 플레이리스트 목록 ----------------
+    with left:
+        with st.container(border=True):
+            st.markdown("**📚 저장된 플레이리스트**")
+            rows = list_saved_playlists() if ready else []
+            if not ready:
+                st.warning("GitHub 설정을 먼저 완료하세요.")
+            elif not rows:
+                st.info("저장된 플레이리스트가 없습니다.")
+            else:
+                for r in rows:
+                    base = os.path.splitext(r["name"])[0]
+                    c_name, c_load, c_del = st.columns([0.64, 0.18, 0.18])
+                    c_name.write(f"• {base}")
+                    if c_load.button("📂", key=f"load_{r['path']}", help="불러오기", use_container_width=True):
+                        ok, msg = load_playlist_from_repo(r["path"])
+                        if ok: st.success(msg)
+                        else:  st.error(msg)
+                        st.rerun()
+                    if c_del.button("🗑", key=f"del_{r['path']}", help="지우기", use_container_width=True):
+                        ok, msg = delete_playlist_by_path(r["path"])
+                        if ok:
+                            st.toast("플레이리스트를 삭제했습니다.")
+                            st.rerun()
+                        else:
+                            st.error(msg)
 
 # =============================
 # TABS
@@ -772,12 +1106,9 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs(["① 웹하드", "② 메모장", "③ �
 with tab1:
     st.header("① 웹하드")
 
-    # 40:60 + top align
     col_upload, col_list = st.columns([0.40, 0.60], vertical_alignment="top")
 
-    # ---- 좌: 업로더 ----
     with col_upload:
-        # ⬆️ Upload 아이콘으로 변경 (심플)
         st.markdown('<div class="section-label"><span class="ico">⬆️</span><span>파일 업로드</span></div>', unsafe_allow_html=True)
         files = st.file_uploader(
             "",
@@ -818,7 +1149,6 @@ with tab1:
                 if any(isinstance(r.get("status"), str) and r["status"].startswith("error") for r in results):
                     st.warning("일부 항목 업로드 실패")
 
-    # ---- 우: 파일 목록 ----
     with col_list:
         st.markdown('<div class="section-label"><span class="ico">📁</span><span>파일 목록</span></div>', unsafe_allow_html=True)
         with st.container(border=True):
@@ -1299,6 +1629,8 @@ with tab3:
                     if hint:
                         item["hint"] = hint
 
+                    snippet_folder = ensure_folder_path(st.session_state.snippet_folder)
+                    snippet_path = path_join(snippet_folder, "snippets.json")
                     current, sha = load_snippets(owner, repo, branch, snippet_path, token)
                     current.append(item)
                     new_sha = save_snippets(owner, repo, branch, snippet_path, token, current, sha)
@@ -1318,4 +1650,4 @@ with tab4:
 with tab5:
     _settings_panel()
     st.markdown("---")
-    st.caption("Tip: 설정 탭에서 업로드/메모/스니펫 폴더와 인라인 다운로드 한도를 변경할 수 있어요. GH_TOKEN은 secrets.toml에 보관됩니다.")
+    st.caption("Tip: 설정 탭에서 업로드/메모/스니펫/플레이리스트 폴더와 인라인 다운로드 한도를 변경할 수 있어요. GH_TOKEN은 secrets.toml에 보관됩니다.")
