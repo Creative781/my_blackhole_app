@@ -663,8 +663,10 @@ def delete_playlist_by_path(path: str) -> Tuple[bool, str]:
         return False, f"삭제 실패: {e}"
 
 # ---------- 숨김 YouTube 플레이어 + 타이머(헤더) ----------
+# ---------- 숨김 YouTube 플레이어 + 타이머(헤더) ----------
 def _render_hidden_youtube_player(video_id: str, start_at: int, before_secs: int, total_secs_opt: Optional[int], playing: bool):
-    """비디오는 숨기고 오디오만. 헤더 pill(전체 진행) 실시간 업데이트."""
+    """비디오는 숨기고 오디오만. 헤더 pill(전체 진행) 실시간 업데이트.
+       자동재생 정책 회피: 자동재생 시에는 항상 mute로 시작하고, 버튼 클릭 시 unMute."""
     total_val = total_secs_opt if (total_secs_opt is not None) else 0
     total_label = format_duration(total_secs_opt if total_secs_opt is not None else None)
     init_label = f"{format_duration(before_secs + start_at)} / {total_label}"
@@ -673,11 +675,11 @@ def _render_hidden_youtube_player(video_id: str, start_at: int, before_secs: int
       .hdr-wrap{display:flex;justify-content:flex-end;align-items:center;gap:8px;}
       .pill{padding:4px 10px;border-radius:999px;background:#f3f4f6;font-size:12px;color:#111}
       .tap{padding:4px 10px;border-radius:999px;border:1px solid #c7d2fe;background:#eef2ff;cursor:pointer;font-size:12px;}
-      /* 완전 숨기면 일부 브라우저에서 재생이 막히는 경우가 있어 1x1, opacity 0으로 이동 */
+      /* 완전 display:none 대신 1x1 + 투명 처리 (일부 브라우저 정책 회피) */
       #yt-holder{position:absolute; left:-9999px; top:-9999px; width:1px; height:1px; opacity:0; pointer-events:none;}
     </style>
     <div class="hdr-wrap">
-      <button id="tap-btn" class="tap" style="display:none">🔊 클릭하여 재생</button>
+      <button id="tap-btn" class="tap" style="display:none">🔊 소리 켜기</button>
       <span id="hdr-pill" class="pill">$init_label</span>
       <div id="yt-holder"><div id="ytplayer"></div></div>
     </div>
@@ -687,6 +689,7 @@ def _render_hidden_youtube_player(video_id: str, start_at: int, before_secs: int
         var startAt  = $startAt;
         var before   = $beforeSecs;
         var total    = $totalSecs;
+
         function pad2(n){ return String(n).padStart(2,'0'); }
         function fmt(t) {
           if (total == 0 && t<0) t=0;
@@ -706,48 +709,76 @@ def _render_hidden_youtube_player(video_id: str, start_at: int, before_secs: int
           if (t) t.style.display = show ? 'inline-flex' : 'none';
         }
 
-        // Load iframe API
+        // YouTube Iframe API 로드
         var tag = document.createElement('script');
         tag.src = "https://www.youtube.com/iframe_api";
         var firstScriptTag = document.getElementsByTagName('script')[0];
         firstScriptTag.parentNode.insertBefore(tag, firstScriptTag);
-        var player, ready=false, firstPlayTried=false;
+
+        var player, ready=false;
         window.onYouTubeIframeAPIReady = function(){
           player = new YT.Player('ytplayer', {
             width:'1', height:'1',
             videoId:'$vid',
             playerVars:{
-              autoplay: 0, controls: 0, disablekb: 1, modestbranding: 1, rel: 0,
+              autoplay: wantPlay ? 1 : 0,   // 재생 중이면 자동재생
+              controls: 0, disablekb: 1, modestbranding: 1, rel: 0,
               fs: 0, playsinline: 1, start: startAt, origin: window.location.origin
             },
             events:{
               onReady: function(){
                 ready = true;
-                try { player.setVolume(100); player.unMute(); } catch(e){}
-                if (wantPlay) tryPlay();
+                try { player.setVolume(100); } catch(e){}
+                if (wantPlay) {
+                  // 자동재생은 항상 mute로 시작 (브라우저 정책 회피)
+                  try { player.mute(); } catch(e){}
+                  // startAt 반영
+                  try { player.seekTo(startAt, true); } catch(e){}
+                  try { player.playVideo(); } catch(e){}
+                  // 음소거 상태라면 사용자에게 '소리 켜기' 버튼 노출
+                  setTimeout(function(){
+                    try {
+                      if (player.isMuted()) { showTap(true); }
+                      else { showTap(false); }
+                    } catch(_) { showTap(true); }
+                  }, 50);
+                } else {
+                  // 일시정지 상태: 버튼은 숨김
+                  showTap(false);
+                }
               },
               onStateChange: function(e){
-                if (e && e.data === YT.PlayerState.PLAYING) { showTap(false); }
-                if (e && e.data === YT.PlayerState.ENDED) { showTap(true); }
+                if (!e) return;
+                if (e.data === YT.PlayerState.PLAYING) {
+                  // 재생 중인데 여전히 mute면 버튼 표시
+                  try { showTap(player.isMuted()); } catch(_) {}
+                } else if (e.data === YT.PlayerState.ENDED) {
+                  // 끝나면 버튼 표시 (다음 트랙 로직은 파이썬 쪽에서 처리)
+                  showTap(true);
+                }
               },
               onError: function(){ showTap(true); }
             }
           });
         };
 
-        async function tryPlay(){
+        // 사용자 클릭으로 unMute + 재생 (이 동작이 '사용자 제스처'로 인정되어 소리 허용)
+        async function enableSound(){
           try {
             if (!ready) return;
             try { player.seekTo(startAt, true); } catch(e){}
-            var p = player.playVideo();
+            try { player.unMute(); } catch(e){}
+            try { player.setVolume(100); } catch(e){}
+            try { player.playVideo(); } catch(e){}
             showTap(false);
-            firstPlayTried = true;
           } catch(e){
+            // 실패하면 버튼 유지
             showTap(true);
           }
         }
 
-        var base = startAt, startedAt = Date.now(), useLocalTimer = !wantPlay;
+        // 전체 진행 표시용 타이머
+        var base = startAt, startedAt = Date.now();
         function tick(){
           var t = base;
           try {
@@ -760,15 +791,11 @@ def _render_hidden_youtube_player(video_id: str, start_at: int, before_secs: int
             }
           } catch(_) {}
           render(t);
-
-          // 현재 행 타이머가 같은 iframe 내에 있을 때 업데이트(이 파일에서는 행 별 iframe에서 자체 처리)
         }
         clearInterval(window.__yt_hdr_timer__); window.__yt_hdr_timer__ = setInterval(tick, 250); tick();
 
         var tap = document.getElementById('tap-btn');
-        if (tap) tap.addEventListener('click', tryPlay);
-        // 초기 자동 시도
-        if (wantPlay) setTimeout(()=>{ tryPlay(); }, 50);
+        if (tap) tap.addEventListener('click', enableSound);
       })();
     </script>
     """)
@@ -1686,3 +1713,4 @@ with tab5:
     _settings_panel()
     st.markdown("---")
     st.caption("Tip: 설정 탭에서 업로드/메모/스니펫/플레이리스트 폴더와 인라인 다운로드 한도를 변경할 수 있어요. GH_TOKEN은 secrets.toml에 보관됩니다.")
+
