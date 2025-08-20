@@ -278,6 +278,10 @@ def _init_state():
     if "_show_save_prompt" not in ss: ss._show_save_prompt = False
     if "_recent_saved_msg" not in ss: ss._recent_saved_msg = ""
 
+    # 현재 플레이리스트 메타
+    if "playlist_name" not in ss: ss.playlist_name = "새 플레이리스트"
+    if "playlist_path" not in ss: ss.playlist_path = None
+
 _init_state()
 
 def _settings_panel():
@@ -434,21 +438,23 @@ class Track:
     duration: Optional[int]
     thumbnail_url: str
     audio_url: Optional[str] = None
-    audio_proto: Optional[str] = None  # 'https' / 'm3u8' / ...
 
 @st.cache_data(show_spinner=False)
 def get_metadata_by_yt_dlp(video_id: str):
-    """Cloud 환경 대비: 직결 오디오 우선, 없으면 HLS(m3u8) 허용."""
+    """yt-dlp로 메타데이터/스트림 URL 조회 (가능하면 m4a/mp4a 코덱 선호)."""
     if ytdlp is None:
         return None
     url = f"https://www.youtube.com/watch?v={video_id}"
     ydl_opts = {
-        "quiet": True, "skip_download": True, "no_warnings": True,
-        "format": "bestaudio/best", "noplaylist": True, "extract_flat": False,
-        "geo_bypass": True, "nocheckcertificate": True,
-        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
-        "concurrent_fragment_downloads": 1,
-        "http_headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+        "quiet": True,
+        "skip_download": True,
+        "no_warnings": True,
+        "format": "bestaudio/best",
+        "noplaylist": True,
+        "extract_flat": False,
+        "geo_bypass": True,
+        "default_search": "ytsearch",
+        "nocheckcertificate": True,
     }
     try:
         with ytdlp.YoutubeDL(ydl_opts) as ydl:
@@ -460,62 +466,41 @@ def get_metadata_by_yt_dlp(video_id: str):
             thumb = info.get("thumbnail")
             if not thumb:
                 thumbs = info.get("thumbnails") or []
-                if thumbs: thumb = thumbs[-1].get("url")
+                if thumbs:
+                    thumb = thumbs[-1].get("url")
             thumb = thumb or f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
 
             fmts = info.get("formats") or []
-
-            def score(f):
-                ext = (f.get("ext") or "").lower()
-                abr = f.get("abr") or 0
-                proto = (f.get("protocol") or "").lower()
-                is_direct = proto in ("http", "https")
-                is_audio = (f.get("vcodec") == "none") and (f.get("acodec") not in (None, "none"))
-                ext_boost = 3 if ext in ("m4a","mp4") else (2 if ext in ("webm","opus") else 0)
-                return (100 if is_audio else 0) + (50 if is_direct else 0) + ext_boost + abr
-
-            best = None
-            # 1) 직결(https) 오디오만 먼저
-            for f in sorted(fmts, key=score, reverse=True):
-                proto = (f.get("protocol") or "").lower()
-                if proto not in ("http", "https"):
-                    continue
-                if f.get("vcodec") == "none" and f.get("acodec") not in (None,"none") and f.get("url"):
-                    best = f; break
-
-            # 2) 보조: HLS(m3u8)
-            if not best:
+            audio_url = None
+            # 1) m4a/mp4a 계열을 최우선 (사파리/모바일 호환)
+            for f in fmts:
+                if f.get("vcodec") == "none" and (f.get("ext") in ("m4a", "mp4")):
+                    ac = f.get("acodec") or ""
+                    if ("mp4a" in ac) and f.get("url"):
+                        audio_url = f["url"]; break
+            # 2) 없다면 audio/mp4 MIME을 선호
+            if not audio_url:
                 for f in fmts:
-                    proto = (f.get("protocol") or "").lower()
-                    if proto in ("m3u8", "m3u8_native") and f.get("url"):
-                        best = f; break
-
-            # 3) 더 보조
-            if not best:
-                for f in sorted(fmts, key=score, reverse=True):
-                    if f.get("acodec") not in (None,"none") and f.get("url"):
-                        best = f; break
-
-            if not best and info.get("requested_formats"):
-                for f in info["requested_formats"]:
-                    if f.get("url"):
-                        best = f; break
-
-            if not best and info.get("url"):
-                best = {"url": info["url"], "protocol": "https"}
-
-            if not best or not best.get("url"):
+                    if f.get("vcodec") == "none" and f.get("url"):
+                        mime = f.get("mimeType") or ""
+                        if "audio/mp4" in mime:
+                            audio_url = f["url"]; break
+            # 3) 최후 fallback: 아무 오디오나
+            if not audio_url:
+                for f in fmts:
+                    if f.get("vcodec") == "none" and f.get("url"):
+                        audio_url = f["url"]; break
+            if not audio_url:
+                audio_url = info.get("url")
+            if not audio_url:
                 return None
-
-            audio_url = best["url"]
-            proto = (best.get("protocol") or "").lower()
-            return {"title": title, "duration": duration, "thumbnail": thumb,
-                    "audio_url": audio_url, "protocol": proto}
+            return {"title": title, "duration": duration, "thumbnail": thumb, "audio_url": audio_url}
     except Exception:
         return None
 
 @st.cache_data(show_spinner=False)
 def get_metadata_by_pytube(video_id: str):
+    """pytube로 보조 조회 (audio/mp4 스트림을 우선 선택)."""
     if YouTube is None:
         return None
     try:
@@ -523,11 +508,14 @@ def get_metadata_by_pytube(video_id: str):
         title = yt.title
         duration = yt.length
         thumb = yt.thumbnail_url or f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
-        audio_stream = yt.streams.filter(only_audio=True).order_by("abr").desc().first()
-        audio_url = getattr(audio_stream, "url", None)
+        # audio/mp4 우선
+        stream = yt.streams.filter(only_audio=True, mime_type="audio/mp4").order_by("abr").desc().first()
+        if not stream:
+            stream = yt.streams.filter(only_audio=True).order_by("abr").desc().first()
+        audio_url = getattr(stream, "url", None)
         if not audio_url:
             return None
-        return {"title": title, "duration": duration, "thumbnail": thumb, "audio_url": audio_url, "protocol": "https"}
+        return {"title": title, "duration": duration, "audio_url": audio_url, "thumbnail": thumb}
     except Exception:
         return None
 
@@ -543,7 +531,6 @@ def resolve_track(video_id: str) -> Optional[Track]:
         duration=meta.get("duration"),
         thumbnail_url=meta.get("thumbnail") or f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
         audio_url=meta.get("audio_url"),
-        audio_proto=(meta.get("protocol") or ("https" if (meta.get("audio_url") or "").startswith("https") else None)),
     )
 
 def _elapsed_now() -> float:
@@ -600,8 +587,7 @@ def _deserialize_tracks(payload: Any) -> List[Track]:
                     title=str(x.get("title", f"Video {vid}")),
                     duration=int(x.get("duration") or 0),
                     thumbnail_url=str(x.get("thumbnail_url") or f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"),
-                    audio_url=None,
-                    audio_proto=None
+                    audio_url=None
                 ))
             except Exception:
                 continue
@@ -627,6 +613,9 @@ def save_current_playlist_to_repo(name: str) -> Tuple[bool, str]:
     body = _json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
     sha, _ = get_file_sha_if_exists(owner, repo, branch, path, token)
     put_file(owner, repo, branch, path, body, token, f"Save playlist: {name}", sha)
+    # 현재 로드된 이름/경로 업데이트
+    st.session_state.playlist_name = name
+    st.session_state.playlist_path = path
     return True, f"저장 완료: {name}"
 
 def list_saved_playlists() -> List[dict]:
@@ -667,6 +656,10 @@ def load_playlist_from_repo(path: str) -> Tuple[bool, str]:
         st.session_state.elapsed_acc = 0.0
         st.session_state.play_start_ts = None
         st.session_state.is_playing = False
+        # 이름/경로 표시
+        name = str(data.get("name") or os.path.splitext(os.path.basename(path))[0])
+        st.session_state.playlist_name = name
+        st.session_state.playlist_path = path
         return True, f"불러오기 완료: {os.path.basename(path)}"
     except Exception as e:
         return False, f"불러오기 실패: {e}"
@@ -729,16 +722,14 @@ def render_labor_song_tab():
 
     # ---------------- Right (상단: 곡 추가, 그 아래 현재 플레이리스트) ----------------
     with right:
-        # 곡 추가(오른쪽 상단)
+        # 곡 추가: 오른쪽 상단
         with st.expander("➕ 곡 추가", expanded=False):
-            # 폼 제출 후 항상 초기화되도록 clear_on_submit=True
             with st.form("add_form", clear_on_submit=True):
                 url = st.text_input("YouTube URL 또는 영상 ID", key="url_input", placeholder="https://www.youtube.com/watch?v=...")
                 c_add, c_other, _sp = st.columns([0.12, 0.12, 1])
                 submit_add   = c_add.form_submit_button("➕", type="primary", help="현재 플레이리스트에 추가")
                 submit_other = c_other.form_submit_button("📥", help="저장된 다른 재생목록의 마지막에 추가")
 
-            # 현재 목록에 추가
             if submit_add and (url or "").strip():
                 vid = extract_video_id(url)
                 if not vid:
@@ -752,13 +743,14 @@ def render_labor_song_tab():
                         st.session_state.playlist.append(tr)
                         if len(st.session_state.playlist) == 1:
                             st.session_state.current_index = 0
+                        st.session_state.playlist_name = st.session_state.get("playlist_name") or "새 플레이리스트"
                         st.toast(f"추가 완료: {tr.title}")
-                        # 보수적으로 한 번 더 초기화
-                        try: st.session_state["url_input"] = ""
-                        except Exception: pass
+                        try:
+                            st.session_state["url_input"] = ""
+                        except Exception:
+                            pass
                         st.rerun()
 
-            # 다른 저장 목록에 추가
             if submit_other and (url or "").strip():
                 vid = extract_video_id(url.strip())
                 if not vid:
@@ -777,7 +769,6 @@ def render_labor_song_tab():
                         }
                         st.session_state._show_add_to_other = True
 
-            # 선택 영역(다른 목록에 추가)
             if st.session_state._show_add_to_other:
                 with st.container(border=True):
                     st.markdown("**다른 목록에 추가** · 대상 선택")
@@ -797,16 +788,17 @@ def render_labor_song_tab():
                                 title=pend.get("title",""),
                                 duration=pend.get("duration",0),
                                 thumbnail_url=pend.get("thumbnail_url",""),
-                                audio_url=None,
-                                audio_proto=None
+                                audio_url=None
                             )
                             ok, msg = append_track_to_playlist_path(rows[sel_idx]["path"], tr)
                             if ok:
                                 st.toast(msg)
                                 st.session_state._show_add_to_other = False
                                 st.session_state._pending_track = None
-                                try: st.session_state["url_input"] = ""  # 입력창 초기화
-                                except Exception: pass
+                                try:
+                                    st.session_state["url_input"] = ""
+                                except Exception:
+                                    pass
                                 st.rerun()
                             else:
                                 st.error(msg)
@@ -817,12 +809,12 @@ def render_labor_song_tab():
 
         st.markdown("---")
 
-        # ===== 현재 플레이리스트 헤더 =====
+        # ===== 현재 플레이리스트 헤더 (이름 표시) =====
         h_label, h_clear, h_save, h_play = st.columns([6, 0.9, 0.9, 0.9])
         with h_label:
-            st.subheader("▶ 플레이리스트", anchor=False)
+            pl_name = st.session_state.get("playlist_name", "새 플레이리스트")
+            st.subheader(f"▶ 플레이리스트 · {pl_name}", anchor=False)
 
-        # 초기화(🧹) - 저장 왼쪽
         with h_clear:
             if st.button("🧹", key="btn_clear_inline", help="현재 화면 플레이리스트 초기화", use_container_width=True):
                 st.session_state.is_playing = False
@@ -831,6 +823,8 @@ def render_labor_song_tab():
                 st.session_state.current_index = 0
                 st.session_state.playlist = []
                 st.session_state.audio_nonce += 1
+                st.session_state.playlist_name = "새 플레이리스트"
+                st.session_state.playlist_path = None
                 st.rerun()
 
         with h_save:
@@ -855,11 +849,10 @@ def render_labor_song_tab():
         if st.session_state._show_save_prompt:
             name_default = datetime.datetime.now().strftime("노동요 %Y-%m-%d %H%M")
             c_in, c_ok, c_cancel = st.columns([0.60, 0.16, 0.16])
-            pl_name = c_in.text_input("저장 이름", key="pl_save_name_inline", value=name_default, label_visibility="collapsed")
+            pl_name_in = c_in.text_input("저장 이름", key="pl_save_name_inline", value=name_default, label_visibility="collapsed")
             if c_ok.button("저장", key="pl_save_ok", type="primary", use_container_width=True):
-                ok, msg = save_current_playlist_to_repo(pl_name)
+                ok, msg = save_current_playlist_to_repo(pl_name_in)
                 if ok:
-                    st.session_state._recent_saved_msg = msg
                     st.session_state._show_save_prompt = False
                     st.toast(msg)
                     st.rerun()
@@ -875,86 +868,125 @@ def render_labor_song_tab():
         TOTAL_SECS = _playlist_total_secs(pl)
         BEFORE_SECS = _sum_before_index(pl, idx)
         CUR_ELAPSED = int(_elapsed_now()) if (pl and 0 <= idx < len(pl)) else 0
-        START_AT = CUR_ELAPSED
+        START_AT = CUR_ELAPSED  # 현재 트랙 경과
 
         if st.session_state.is_playing and pl:
             cur = pl[idx]
-            # URL 갱신
             fresh = resolve_track(cur.video_id)
             if fresh and fresh.audio_url:
                 cur.audio_url = fresh.audio_url
-                cur.audio_proto = fresh.audio_proto
 
-            # HLS 여부 판단
-            use_hls = (cur.audio_proto in ("m3u8", "m3u8_native", "hls")) or (cur.audio_url or "").endswith(".m3u8")
-
-            # 오디오 + 상단 pill (hls.js 자동 사용)
+            # 헤더: audio + 전체 진행 타이머 (audio.currentTime 우선) + 오토플레이 실패시 오버레이 버튼
             header_tpl = Template("""
-            <div style="display:flex;justify-content:flex-end;align-items:center;">
-              <span id="hdr-pill" style="padding:4px 10px;border-radius:999px;background:#f3f4f6;font-size:12px;color:#111">${init_label}</span>
+            <style>
+              .hdr-wrap{display:flex;justify-content:flex-end;align-items:center;gap:8px;}
+              .pill{padding:4px 10px;border-radius:999px;background:#f3f4f6;font-size:12px;color:#111}
+              .tap{padding:4px 10px;border-radius:999px;border:1px solid #c7d2fe;background:#eef2ff;cursor:pointer;font-size:12px;}
+              .a-wrap{display:flex;align-items:center;gap:8px}
+              audio{height:28px}
+            </style>
+            <div class="hdr-wrap">
+              <button id="tap-btn" class="tap" style="display:none">🔊 클릭하여 재생</button>
+              <span id="hdr-pill" class="pill">${init_label}</span>
+              <div class="a-wrap">
+                <audio id="ytap-audio" src="${src}" controls playsinline preload="metadata" crossorigin="anonymous"></audio>
+              </div>
             </div>
-            <audio id="ytap-audio" style="display:none"></audio>
             <script>
               (function() {
                 var audio = document.getElementById('ytap-audio');
                 var pill = document.getElementById('hdr-pill');
+                var tap  = document.getElementById('tap-btn');
                 var before = ${before};
                 var total = ${total};
                 var startAt = ${startAt};
-                var src = ${src_json};
-                var useHLS = ${use_hls};
+                var isPlayingState = ${is_playing};
 
-                function fmt(t){
+                function pad2(n){ return String(n).padStart(2,'0'); }
+                function fmt(t) {
                   t = Math.max(0, Math.floor(t));
-                  var h = Math.floor(t/3600), m = Math.floor((t%3600)/60), s = Math.floor(t%60);
-                  return h>0 ? (h+":"+String(m).padStart(2,'0')+":"+String(s).padStart(2,'0'))
-                             : (m+":"+String(s).padStart(2,'0'));
+                  var h = Math.floor(t/3600);
+                  var m = Math.floor((t%3600)/60);
+                  var s = Math.floor(t%60);
+                  return (h>0) ? (h + ":" + pad2(m) + ":" + pad2(s)) : (m + ":" + pad2(s));
                 }
-                function setStart(){ try { audio.currentTime = startAt; } catch(e){} }
+                function render(tLocal){
+                  if (pill) pill.textContent = fmt(before + tLocal) + " / " + fmt(total);
+                }
+                function setStart(){ try { audio.currentTime = startAt; } catch(e) {} }
+
+                // 기본 볼륨/음소거 해제
+                try { audio.muted = false; audio.volume = 1.0; } catch(e){}
+
+                // 타이머: audio.currentTime 우선, 불가능할 때만 로컬 타이머 사용
+                var base = startAt, startedAt = Date.now();
                 function tick(){
-                  var t = audio.currentTime || 0;
-                  if (pill) pill.textContent = fmt(before + t) + " / " + fmt(total);
-                }
-                function boot(){
-                  if (useHLS) {
-                    var s = document.createElement('script');
-                    s.src = "https://cdn.jsdelivr.net/npm/hls.js@1.5.13/dist/hls.min.js";
-                    s.onload = function(){
-                      try{
-                        if (window.Hls && window.Hls.isSupported()) {
-                          var hls = new window.Hls({lowLatencyMode:false, liveDurationInfinity:true});
-                          hls.loadSource(src);
-                          hls.attachMedia(audio);
-                          hls.on(window.Hls.Events.MANIFEST_PARSED, function(){ audio.play && audio.play().catch(()=>{}); });
-                        } else {
-                          audio.src = src;  // 사파리 등 네이티브 HLS
-                          audio.play && audio.play().catch(()=>{});
-                        }
-                      }catch(e){ audio.src = src; audio.play && audio.play().catch(()=>{}); }
-                      setStart();
-                    };
-                    (document.head||document.body).appendChild(s);
-                  } else {
-                    audio.src = src;
-                    audio.play && audio.play().catch(()=>{});
-                    setStart();
+                  var t = base;
+                  if (!audio.paused && !isNaN(audio.currentTime)) {
+                    t = audio.currentTime || base;
+                  } else if (isPlayingState) {
+                    var dt = (Date.now() - startedAt) / 1000.0;
+                    t = base + dt;
                   }
-                  clearInterval(window.__ytap_header_timer__);
-                  window.__ytap_header_timer__ = setInterval(tick, 200);
-                  tick();
+                  render(t);
                 }
-                boot();
+                clearInterval(window.__ytap_hdr_timer__); window.__ytap_hdr_timer__ = setInterval(tick, 200); tick();
+
+                function showTap(show){ if (tap) tap.style.display = show ? 'inline-flex' : 'none'; }
+
+                async function tryPlayUserGesture(){
+                  // iOS/Safari 안정화: 오디오컨텍스트 깨우기
+                  try {
+                    var Ctx = window.AudioContext || window.webkitAudioContext;
+                    if (Ctx) { var ac = new Ctx(); await ac.resume().catch(()=>{}); }
+                  } catch(e){}
+                  try { audio.muted = false; audio.volume = Math.max(0.4, audio.volume || 1.0); } catch(e){}
+                  try { setStart(); } catch(e){}
+                  try {
+                    const p = audio.play();
+                    if (p && p.then) {
+                      await p;
+                      showTap(false);
+                      startedAt = Date.now();
+                    } else {
+                      showTap(false);
+                    }
+                  } catch(e) {
+                    showTap(true);
+                  }
+                }
+
+                // 자동 시도 (정책에 막히면 버튼 노출)
+                (async function init(){
+                  try { setStart(); } catch(e){}
+                  if (isPlayingState) {
+                    try {
+                      await tryPlayUserGesture();
+                    } catch(e) { showTap(true); }
+                  }
+                })();
+
+                // 이벤트: 재생/일시정지에 맞춰 버튼 토글
+                audio.addEventListener('play', ()=>showTap(false));
+                audio.addEventListener('playing', ()=>showTap(false));
+                audio.addEventListener('pause', ()=>{ if(isPlayingState){ showTap(true);} });
+                audio.addEventListener('ended', ()=>showTap(true));
+                audio.addEventListener('error', ()=>showTap(true));
+                if (tap) tap.addEventListener('click', tryPlayUserGesture);
               })();
             </script>
             """)
+            init_label = f"{format_duration(BEFORE_SECS + START_AT)} / {format_duration(TOTAL_SECS)}"
             st_html(header_tpl.substitute(
-                init_label=f"{format_duration(BEFORE_SECS + START_AT)} / {format_duration(TOTAL_SECS)}",
-                src_json=_json.dumps(f"{cur.audio_url}?n={st.session_state.audio_nonce}", ensure_ascii=False),
-                before=BEFORE_SECS, total=TOTAL_SECS, startAt=START_AT,
-                use_hls=str(bool(use_hls)).lower(),
-            ), height=48, scrolling=False)
+                init_label=init_label,
+                src=f"{cur.audio_url}?n={st.session_state.audio_nonce}",
+                before=BEFORE_SECS,
+                total=TOTAL_SECS,
+                startAt=START_AT,
+                is_playing="true" if st.session_state.is_playing else "false",
+            ), height=64, scrolling=False)
         else:
-            # 일시정지/정지 상태: 정적 표시
+            # 일시정지/정지: 정적 표시
             st.markdown(
                 f"<div style='text-align:right'><span style='padding:4px 10px;border-radius:999px;background:#f3f4f6;font-size:12px;color:#111'>{format_duration(BEFORE_SECS + CUR_ELAPSED)} / {format_duration(TOTAL_SECS)}</span></div>",
                 unsafe_allow_html=True,
@@ -963,9 +995,11 @@ def render_labor_song_tab():
         st.markdown("---")
 
         # ===== 현재 플레이리스트 표 =====
-        if not pl:
+        if not st.session_state.playlist:
             st.info("아직 추가된 곡이 없습니다. 위의 ➕에서 URL을 붙여넣고 추가하세요.")
         else:
+            pl = st.session_state.playlist
+            idx = st.session_state.current_index
             for i, tr in enumerate(pl):
                 left_c, mid_c, right_c = st.columns([0.6, 6, 2.8])
                 left_c.image(tr.thumbnail_url, width=56)
@@ -975,10 +1009,10 @@ def render_labor_song_tab():
                     title_html += " <span style='display:inline-block;padding:2px 8px;font-size:12px;border-radius:999px;background:#5B6CFF;color:#fff;margin-left:8px'>Now Playing</span>"
                 mid_c.markdown(title_html, unsafe_allow_html=True)
 
-                # --- 행 하단 시간표시 ---
+                # --- 행 하단 시간표시 (재생 중인 행은 로컬 타이머 실시간 갱신) ---
                 if st.session_state.is_playing and i == idx:
-                    # 현재 재생 중인 행만 실시간 로컬 타이머로 갱신 (iframe 간 통신 불필요)
                     row_total_str = format_duration(tr.duration)
+                    is_playing_js = "true" if st.session_state.is_playing else "false"
                     base_at = START_AT
                     row_tpl = Template("""
                     <div style="font-size:12px;color:#666;margin-bottom:8px;line-height:1.25">
@@ -986,18 +1020,24 @@ def render_labor_song_tab():
                     </div>
                     <script>
                       (function() {
-                        function fmt(t){
+                        function pad2(n){ return String(n).padStart(2,'0'); }
+                        function fmt(t) {
                           t = Math.max(0, Math.floor(t));
-                          var h = Math.floor(t/3600), m = Math.floor((t%3600)/60), s = Math.floor(t%60);
-                          return h>0 ? (h+":"+String(m).padStart(2,'0')+":"+String(s).padStart(2,'0'))
-                                     : (m+":"+String(s).padStart(2,'0'));
+                          var h = Math.floor(t/3600);
+                          var m = Math.floor((t%3600)/60);
+                          var s = Math.floor(t%60);
+                          return (h>0) ? (h + ":" + pad2(m) + ":" + pad2(s)) : (m + ":" + pad2(s));
                         }
                         var lab = document.getElementById('row-elapsed');
-                        var base = ${base_at};
+                        var isPlaying = ${is_playing};
+                        var base = ${base_at};  // 렌더 시 경과초
                         var startedAt = Date.now();
                         function tick(){
-                          var dt = (Date.now() - startedAt) / 1000.0;
-                          var t = base + dt;
+                          var t = base;
+                          if (isPlaying) {
+                            var dt = (Date.now() - startedAt) / 1000.0;
+                            t = base + dt;
+                          }
                           if (lab) lab.textContent = fmt(t);
                         }
                         clearInterval(window.__ytap_row_timer__);
@@ -1008,12 +1048,12 @@ def render_labor_song_tab():
                     """)
                     st_html(row_tpl.substitute(
                         vid=tr.video_id,
-                        init_elapsed=format_duration(base_at),
+                        init_elapsed=format_duration(START_AT),
                         row_total=row_total_str,
+                        is_playing=is_playing_js,
                         base_at=base_at
                     ), height=36, scrolling=False)
                 else:
-                    # 다른 행은 정적 표기(0부터)
                     mid_c.markdown(
                         f"<div style='font-size:12px;color:#666;margin-bottom:8px;line-height:1.25'>ID: {tr.video_id} · 0:00 / {format_duration(tr.duration)}</div>",
                         unsafe_allow_html=True,
