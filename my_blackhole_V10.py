@@ -226,6 +226,24 @@ st.markdown(
       div[data-testid="stFileDropzone"] { min-height: 160px; }
       div[data-testid="stFileUploader"] section[tabindex="0"] { min-height: 160px; padding: .9rem .9rem; }
       section[data-testid="stFileUploadDropzone"] { min-height: 160px; }
+
+      /* ---- 모바일에서 아이콘들이 한 줄씩 차지하는 문제 해결 (헤더/리스트/행 공통) ---- */
+      .hdrctl-marker + div[data-testid="stHorizontalBlock"],
+      .iconrow-marker + div[data-testid="stHorizontalBlock"],
+      .rowctl-marker + div[data-testid="stHorizontalBlock"]{
+        display:flex !important; flex-wrap:nowrap !important;
+        gap:4px !important; align-items:center !important;
+      }
+      .hdrctl-marker + div[data-testid="stHorizontalBlock"] > div[data-testid="column"],
+      .iconrow-marker + div[data-testid="stHorizontalBlock"] > div[data-testid="column"],
+      .rowctl-marker + div[data-testid="stHorizontalBlock"] > div[data-testid="column"]{
+        width:auto !important; min-width:auto !important; padding:0 !important; flex:0 0 auto !important;
+      }
+      .hdrctl-marker + div[data-testid="stHorizontalBlock"] button,
+      .iconrow-marker + div[data-testid="stHorizontalBlock"] button,
+      .rowctl-marker + div[data-testid="stHorizontalBlock"] button{
+        min-width:32px !important; padding:.15rem .35rem !important;
+      }
     </style>
     """,
     unsafe_allow_html=True,
@@ -262,7 +280,7 @@ def _init_state():
             st.secrets.get("PLAYLIST_FOLDER", path_join("my-blackhole", "_playlists"))
         )
 
-    # 메모리 절약: 기본값 0MB => Data URL 비활성 (원하면 설정 탭에서 올려)
+    # 메모리 절약: 기본값 0MB => Data URL 비활성
     if "inline_dl_limit_mb" not in ss:
         ss.inline_dl_limit_mb = float(st.secrets.get("INLINE_DL_LIMIT_MB", 0))
 
@@ -463,7 +481,7 @@ def _yt_oembed(video_id: str) -> Optional[dict]:
 @st.cache_data(ttl=24*3600, show_spinner=False)
 def get_metadata_only(video_id: str) -> Optional[Track]:
     """가능하면 길이까지, 아니면 제목/썸네일만."""
-    # 1) yt-dlp가 있으면 duration까지 시도 (Cloud에서 설치 안 됐을 수 있음)
+    # 1) yt-dlp가 있으면 duration까지 시도
     if ytdlp is not None:
         try:
             with ytdlp.YoutubeDL({
@@ -663,7 +681,6 @@ def delete_playlist_by_path(path: str) -> Tuple[bool, str]:
         return False, f"삭제 실패: {e}"
 
 # ---------- 숨김 YouTube 플레이어 + 타이머(헤더) ----------
-# ---------- 숨김 YouTube 플레이어 + 타이머(헤더) ----------
 def _render_hidden_youtube_player(video_id: str, start_at: int, before_secs: int, total_secs_opt: Optional[int], playing: bool):
     """비디오는 숨기고 오디오만. 헤더 pill(전체 진행) 실시간 업데이트.
        자동재생 정책 회피: 자동재생 시에는 항상 mute로 시작하고, 버튼 클릭 시 unMute."""
@@ -675,8 +692,12 @@ def _render_hidden_youtube_player(video_id: str, start_at: int, before_secs: int
       .hdr-wrap{display:flex;justify-content:flex-end;align-items:center;gap:8px;}
       .pill{padding:4px 10px;border-radius:999px;background:#f3f4f6;font-size:12px;color:#111}
       .tap{padding:4px 10px;border-radius:999px;border:1px solid #c7d2fe;background:#eef2ff;cursor:pointer;font-size:12px;}
-      /* 완전 display:none 대신 1x1 + 투명 처리 (일부 브라우저 정책 회피) */
-      #yt-holder{position:absolute; left:-9999px; top:-9999px; width:1px; height:1px; opacity:0; pointer-events:none;}
+      /* iOS: 완전 오프스크린/완전 투명은 오디오/메타 차단될 수 있어, 화면 내 최소 크기로 유지 */
+      #yt-holder{
+        position:fixed; left:0; bottom:0;
+        width:2px; height:2px;
+        opacity:0.01; pointer-events:none; z-index:0;
+      }
     </style>
     <div class="hdr-wrap">
       <button id="tap-btn" class="tap" style="display:none">🔊 소리 켜기</button>
@@ -689,10 +710,10 @@ def _render_hidden_youtube_player(video_id: str, start_at: int, before_secs: int
         var startAt  = $startAt;
         var before   = $beforeSecs;
         var total    = $totalSecs;
+        var totalKnown = $totalKnown;
 
         function pad2(n){ return String(n).padStart(2,'0'); }
         function fmt(t) {
-          if (total == 0 && t<0) t=0;
           t = Math.max(0, Math.floor(t));
           var h = Math.floor(t/3600);
           var m = Math.floor((t%3600)/60);
@@ -701,7 +722,15 @@ def _render_hidden_youtube_player(video_id: str, start_at: int, before_secs: int
         }
         function render(tLocal){
           var pill = document.getElementById('hdr-pill');
-          var totalStr = $totalKnown ? fmt(total) : "--:--";
+          // 총합 미상인 경우, 현재 플레이어의 길이로 보정
+          var dynTotal = total;
+          try{
+            if (!totalKnown && window.__yt_hidden_player && typeof window.__yt_hidden_player.getDuration === 'function'){
+              var d = window.__yt_hidden_player.getDuration() || 0;
+              if (isFinite(d) && d > 0) dynTotal = before + d;
+            }
+          }catch(_){}
+          var totalStr = (totalKnown || (dynTotal && isFinite(dynTotal) && dynTotal>0)) ? fmt(dynTotal) : "--:--";
           if (pill) pill.textContent = fmt(before + tLocal) + " / " + totalStr;
         }
         function showTap(show){
@@ -721,48 +750,44 @@ def _render_hidden_youtube_player(video_id: str, start_at: int, before_secs: int
             width:'1', height:'1',
             videoId:'$vid',
             playerVars:{
-              autoplay: wantPlay ? 1 : 0,   // 재생 중이면 자동재생
+              autoplay: wantPlay ? 1 : 0,
               controls: 0, disablekb: 1, modestbranding: 1, rel: 0,
-              fs: 0, playsinline: 1, start: startAt, origin: window.location.origin
+              fs: 0, playsinline: 1, start: startAt, origin: window.location.origin,
+              enablejsapi: 1
             },
             events:{
               onReady: function(){
                 ready = true;
+                window.__yt_hidden_player = player; // 전역 노출
                 try { player.setVolume(100); } catch(e){}
                 if (wantPlay) {
-                  // 자동재생은 항상 mute로 시작 (브라우저 정책 회피)
                   try { player.mute(); } catch(e){}
-                  // startAt 반영
                   try { player.seekTo(startAt, true); } catch(e){}
                   try { player.playVideo(); } catch(e){}
-                  // 음소거 상태라면 사용자에게 '소리 켜기' 버튼 노출
                   setTimeout(function(){
                     try {
                       if (player.isMuted()) { showTap(true); }
                       else { showTap(false); }
                     } catch(_) { showTap(true); }
-                  }, 50);
+                  }, 100);
                 } else {
-                  // 일시정지 상태: 버튼은 숨김
                   showTap(false);
                 }
               },
               onStateChange: function(e){
                 if (!e) return;
                 if (e.data === YT.PlayerState.PLAYING) {
-                  // 재생 중인데 여전히 mute면 버튼 표시
                   try { showTap(player.isMuted()); } catch(_) {}
                 } else if (e.data === YT.PlayerState.ENDED) {
-                  // 끝나면 버튼 표시 (다음 트랙 로직은 파이썬 쪽에서 처리)
                   showTap(true);
                 }
               },
               onError: function(){ showTap(true); }
             }
           });
+          window.__yt_hidden_player = player;
         };
 
-        // 사용자 클릭으로 unMute + 재생 (이 동작이 '사용자 제스처'로 인정되어 소리 허용)
         async function enableSound(){
           try {
             if (!ready) return;
@@ -772,12 +797,10 @@ def _render_hidden_youtube_player(video_id: str, start_at: int, before_secs: int
             try { player.playVideo(); } catch(e){}
             showTap(false);
           } catch(e){
-            // 실패하면 버튼 유지
             showTap(true);
           }
         }
 
-        // 전체 진행 표시용 타이머
         var base = startAt, startedAt = Date.now();
         function tick(){
           var t = base;
@@ -906,6 +929,7 @@ def render_labor_song_tab():
         st.markdown("---")
 
         # ===== 현재 플레이리스트 헤더 (이름 표시) =====
+        st.markdown("<div class='hdrctl-marker'></div>", unsafe_allow_html=True)  # 모바일 1행 고정 마커
         h_label, h_clear, h_save, h_play = st.columns([6, 0.9, 0.9, 0.9])
         with h_label:
             pl_name = st.session_state.get("playlist_name", "새 플레이리스트")
@@ -1000,14 +1024,14 @@ def render_labor_song_tab():
                     title_html += " <span style='display:inline-block;padding:2px 8px;font-size:12px;border-radius:999px;background:#5B6CFF;color:#fff;margin-left:8px'>Now Playing</span>"
                 mid_c.markdown(title_html, unsafe_allow_html=True)
 
-                # --- 행 하단 시간표시 (재생 중인 행은 로컬 타이머) ---
+                # --- 행 하단 시간표시 (재생 중인 행은 로컬 타이머 + 총길이 동적 보정) ---
                 if st.session_state.is_playing and i == idx:
                     row_total_str = format_duration(tr.duration)
                     is_playing_js = "true" if st.session_state.is_playing else "false"
                     base_at = START_AT
                     row_tpl = Template("""
                     <div style="font-size:12px;color:#666;margin-bottom:8px;line-height:1.25">
-                      ID: $vid · <span id="row-elapsed">$init_elapsed</span> / $row_total
+                      ID: $vid · <span id="row-elapsed">$init_elapsed</span> / <span id="row-total">$row_total</span>
                     </div>
                     <script>
                       (function() {
@@ -1020,9 +1044,20 @@ def render_labor_song_tab():
                           return (h>0) ? (h + ":" + pad2(m) + ":" + pad2(s)) : (m + ":" + pad2(s));
                         }
                         var lab = document.getElementById('row-elapsed');
+                        var tot = document.getElementById('row-total');
                         var isPlaying = $is_playing;
                         var base = $base_at;  // 렌더 시 경과초
                         var startedAt = Date.now();
+
+                        function updateTotal(){
+                          try{
+                            if (window.__yt_hidden_player && typeof window.__yt_hidden_player.getDuration === 'function'){
+                              var d = window.__yt_hidden_player.getDuration() || 0;
+                              if (isFinite(d) && d > 0 && tot) tot.textContent = fmt(d);
+                            }
+                          }catch(_){}
+                        }
+
                         function tick(){
                           var t = base;
                           if (isPlaying) {
@@ -1030,10 +1065,9 @@ def render_labor_song_tab():
                             t = base + dt;
                           }
                           if (lab) lab.textContent = fmt(t);
+                          updateTotal();
                         }
-                        clearInterval(window.__ytap_row_timer__);
-                        window.__ytap_row_timer__ = setInterval(tick, 250);
-                        tick();
+                        clearInterval(window.__ytap_row_timer__); window.__ytap_row_timer__ = setInterval(tick, 250); tick();
                       })();
                     </script>
                     """)
@@ -1050,8 +1084,9 @@ def render_labor_song_tab():
                         unsafe_allow_html=True,
                     )
 
-                # 오른쪽 컨트롤
-                pcol, upcol, downcol, delcol = right_c.columns([0.9, 0.9, 0.9, 0.9])
+                # 오른쪽 컨트롤 — 모바일에서 한 줄 유지 (마커 + 인접 형제 CSS)
+                right_c.markdown("<div class='rowctl-marker'></div>", unsafe_allow_html=True)
+                pcol, upcol, downcol, delcol = right_c.columns([0.22, 0.22, 0.22, 0.22], gap="small")
                 is_this_playing = st.session_state.is_playing and (i == idx)
                 if pcol.button("⏸" if is_this_playing else "⏵", key=f"play_{i}", help="재생/일시정지"):
                     if i == idx:
@@ -1113,6 +1148,8 @@ def render_labor_song_tab():
             else:
                 for r in rows:
                     base = os.path.splitext(r["name"])[0]
+                    # 모바일 1행 고정 마커 + 동일 그리드
+                    st.markdown("<div class='iconrow-marker'></div>", unsafe_allow_html=True)
                     c_name, c_load, c_del = st.columns([0.64, 0.18, 0.18])
                     c_name.write(f"• {base}")
                     if c_load.button("📂", key=f"load_{r['path']}", help="불러오기", use_container_width=True):
@@ -1670,7 +1707,7 @@ with tab3:
 
     st_html(SNIP_TEMPLATE.substitute(CHIPS_HTML=chips_html), height=100)
 
-    st.caption("위: 스니펫 — 드래그로 순서 변경 · 클릭=복사 · 우클릭=삭제 · '제목:내용' 입력 시 제목은 툴팁, 내용은 버튼 라벨/복사값")
+    st.caption("위: 스니펫 — 드래그로 순서 변경 · 클릭=복사 · 우클릭=삭제 · '제목:내용' 입력 시 제목은 툴팁, 내용은 버튼 라벨이 됩니다.")
 
     st.text_area("등록할 텍스트 (예: 카드번호:112344)", key="snip_input", height=100, placeholder="여기에 텍스트를 입력하세요. '제목:내용' 형식을 쓰면 제목은 툴팁, 내용은 버튼 라벨이 됩니다.")
     col_reg, _sp = st.columns([0.15, 1], gap="small")
@@ -1713,4 +1750,3 @@ with tab5:
     _settings_panel()
     st.markdown("---")
     st.caption("Tip: 설정 탭에서 업로드/메모/스니펫/플레이리스트 폴더와 인라인 다운로드 한도를 변경할 수 있어요. GH_TOKEN은 secrets.toml에 보관됩니다.")
-
